@@ -35,7 +35,7 @@ targets Linux + NVIDIA.
     --prompt "A corgi surfing a wave at sunset" --seed 0 --output outputs/corgi.mp4
 ```
 
-Expected on an M4 Max: ~63 s per video, an 81-frame 832×480 16 fps H.264 file, ~20 GB peak.
+Expected on an M4 Max: ~45-50 s per video (flash attention; ~65-85 s with `FASTFRAMES_MPS_ATTN=sdpa`), an 81-frame 832×480 16 fps H.264 file, ~20 GB peak.
 There are no unit tests for the inference path. Verify a change by:
 
 1. Generating with a fixed prompt and seed, before and after the change.
@@ -54,9 +54,15 @@ There are no unit tests for the inference path. Verify a change by:
   (`model.freqs`) deliberately stays on CPU under MPS.
 - **Don't call SDPA with all heads at once on MPS.** MPS caches one MPSGraph *plus its FP32
   score buffer* for every input shape, and `empty_cache()` cannot free it. The self-attention
-  key length grows every frame (21 shapes), so all-heads calls retain ~60 GB. `attention()`
-  calls SDPA one head at a time (~6 GB, and also faster). Any new attention path must keep
-  memory flat across key lengths.
+  key length grows every frame (21 shapes), so all-heads calls retain ~60 GB. Any attention
+  path must keep memory flat across key lengths.
+- **Attention on MPS defaults to the Metal flash kernel** (`fastframes/wan/mps_flash_attention.py`,
+  compiled at runtime with `torch.mps.compile_shader`). It's ~2x faster than SDPA and closer to an
+  fp32 reference, with no per-shape state. `FASTFRAMES_MPS_ATTN=sdpa` switches back to per-head
+  SDPA, which is also the automatic fallback for causal/dropout/tiny inputs or if the lane-layout
+  probe fails. The kernel relies on the simdgroup-matrix lane layout (unspecified by MSL, probed
+  at first use) and on straight-line generated source: the loop/array version was ~2.5x slower.
+  Benchmark changes with `scripts/bench_mps_attention.py`.
 - **The per-frame `synchronize()` + `empty_cache()`** in `FastFrames.rollout` keeps the
   allocator from hoarding odd-sized buffers. `empty_cache()` without the sync frees nothing
   while command buffers are still in flight.
