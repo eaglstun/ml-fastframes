@@ -27,6 +27,7 @@ from PIL import Image  # noqa: E402
 from apps.lingbot.conditioning import CHUNK, KeyboardCamera, LiveCamera, Trajectory  # noqa: E402
 from apps.lingbot.pipeline import MODELS, FastFramesLingBot, configure_backends  # noqa: E402
 from apps.lingbot.upstream import import_upstream  # noqa: E402
+from fastframes.device import default_device, synchronize  # noqa: E402
 from fastframes.video import save_video  # noqa: E402
 
 OFFICIAL = {"lingbot-1.3b": "lingbot-world-v2-1.3b-causal-fast"}
@@ -51,6 +52,10 @@ def init_distributed():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world not in (1, 8):
         raise RuntimeError(f"FastFrames-LingBot runs on 1 or 8 GPUs, not {world}")
+    if not torch.cuda.is_available():
+        if world > 1:
+            raise RuntimeError("multi-device LingBot needs CUDA")
+        return world, rank
     torch.cuda.set_device(local_rank)
     if world > 1:
         # Context parallel with expandable segments ended in an illegal memory access during warm-up.
@@ -65,11 +70,13 @@ def init_distributed():
 def load_pipeline(args, world, rank):
     configure_backends()
     root = args.checkpoint_dir
+    eager = args.eager or not torch.cuda.is_available()
     return FastFramesLingBot.from_pretrained(
         args.model, lingbot_root=args.lingbot_root,
         lingbot_checkpoint=args.lingbot_checkpoint or root / OFFICIAL[args.model],
         assets_dir=args.assets_dir or root / SHARED_ASSETS, checkpoint_dir=root / args.model,
-        world=world, rank=rank, compile=not args.eager, graphs=not args.eager)
+        # torch.compile (inductor max-autotune) and CUDA graphs are CUDA-only here: eager elsewhere
+        world=world, rank=rank, compile=not eager, graphs=not eager)
 
 
 def read_condition(args):
@@ -90,11 +97,11 @@ def read_condition(args):
         actions = list(spec["actions"])
         if frames:
             actions = actions[:(frames + 3) // 16]
-        keyboard, live = KeyboardCamera(), LiveCamera(device="cuda")
+        keyboard, live = KeyboardCamera(), LiveCamera(device=default_device())
         return image, prompt, (lambda chunk: live.rays(keyboard.chunk(actions[chunk]))), len(actions), seed
     poses = np.load(base / spec["poses"])
     intrinsics = np.load(base / spec["intrinsics"])
-    trajectory = Trajectory(poses, intrinsics, frames or len(poses), device="cuda")
+    trajectory = Trajectory(poses, intrinsics, frames or len(poses), device=default_device())
     return image, prompt, trajectory.rays, trajectory.num_chunks, seed
 
 
@@ -118,7 +125,7 @@ def main():
     start = time.perf_counter()
     pipe.start(image, prompt, seed=seed, latents=CHUNK * chunks)
     frames = [pipe.step(rays(chunk)) for chunk in range(chunks)]
-    torch.cuda.synchronize()
+    synchronize(pipe.device)
     if rank == 0:
         video = torch.cat(frames).cpu()
         save_video(args.output, video)
