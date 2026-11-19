@@ -60,11 +60,11 @@ synchronized, median):
 
 | keys | flash | SDPA per head |
 |---|---|---|
-| 512 (cross-attention) | 0.6 ms | 2.0 ms |
-| 1,560 | 1.6 ms | 3.5 ms |
-| 15,600 | 14.0 ms | 28.8 ms |
-| 32,760 | 29.7 ms | 64.9 ms |
-| sum over the 21 KV lengths | **327 ms** | 684 ms |
+| 512 (cross-attention) | 1.1 ms | 1.8 ms |
+| 1,560 | 1.5 ms | 3.0 ms |
+| 15,600 | 14.0 ms | 28.5 ms |
+| 32,760 | 29.8 ms | 64.2 ms |
+| sum over the 21 KV lengths | **326 ms** | 673 ms |
 
 That is ~10.6 TFLOPS for the whole attention, against ~5 for SDPA and 13-14.7 for a bare MPS GEMM.
 Driver memory stays flat across all 22 shapes (1.03 GB in the benchmark, which is the test tensors).
