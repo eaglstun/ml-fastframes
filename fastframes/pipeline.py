@@ -20,6 +20,7 @@ from typing import Optional, Sequence
 
 import torch
 
+from .device import default_device
 from .checkpoints import build_wan, load_state_dict
 from .models.kv_refinement import KVRefinementNetwork
 from .models.pixel_decoder import BridgedPixelDecoder, PixelDecoder, align_frames
@@ -126,8 +127,9 @@ class FastFrames:
         self._refine_embedding = None
 
     @classmethod
-    def from_pretrained(cls, config, wan_dir, dit, refiner, decoder, *, device="cuda"):
+    def from_pretrained(cls, config, wan_dir, dit, refiner, decoder, *, device=None):
         """Build from checkpoint paths (or already-loaded state dicts)."""
+        device = device or default_device()
         def state(value, key=None):
             return value if isinstance(value, dict) else load_state_dict(value, key)
 
@@ -152,7 +154,7 @@ class FastFrames:
 
     def autocast(self):
         if self.config.autocast:
-            return torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False)
+            return torch.autocast(self.device.type, dtype=torch.bfloat16, cache_enabled=False)
         return contextlib.nullcontext()
 
     # ------------------------------------------------------------------ text / noise
@@ -243,6 +245,11 @@ class FastFrames:
                     self._predict(x0, 0.0, frame, text_cache, kv_cache)
                 elif context == "refiner":
                     self._refine(x0, frame, kv_cache)
+                if self.device.type == "mps":
+                    # every frame grows the attended prefix, so the cached buffers never get
+                    # reused and the MPS allocator would otherwise hoard tens of GiB
+                    torch.mps.synchronize()
+                    torch.mps.empty_cache()
         return latents, torch.cat(features, dim=1), torch.cat(modulation, dim=1)
 
     @torch.inference_mode()
@@ -250,7 +257,7 @@ class FastFrames:
         """Pixels ``[1, 81, 3, 480, 832]`` in ``[-1, 1]``."""
         height, width = self.config.latent_size
         grid = torch.tensor([[modulation.shape[1], height // 2, width // 2]], device=self.device, dtype=torch.long)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(self.device.type, dtype=torch.bfloat16):
             pixels = self.decoder(features, modulation, grid)
         return align_frames(pixels, self.config.num_pixel_frames)
 

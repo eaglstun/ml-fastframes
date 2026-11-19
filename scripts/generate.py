@@ -53,9 +53,20 @@ def main():
         jobs = [(p, args.seed + i, out / f"{i:04d}.mp4") for i, p in enumerate(prompts)][args.shard::args.num_shards]
 
     model = load_model(args.model, args.checkpoint_dir)
+    embeds = {}
+    if model.device.type == "mps":
+        # Unified memory is shared: encode every prompt up front, then evict the 11 GB umT5
+        # encoder so the DiT rollout has the room.
+        import gc
+
+        import torch
+        embeds = {p: model.encode_prompt(p) for p in dict.fromkeys(p for p, _, _ in jobs)}
+        model.text_encoder.to("cpu")
+        gc.collect()
+        torch.mps.empty_cache()
     for prompt, seed, path in jobs:
         start = time.perf_counter()
-        frames = model.generate(prompt, seed)
+        frames = model.generate(prompt, seed, prompt_embeds=embeds.get(prompt))
         save_video(path, frames)
         print(f"{path}  seed={seed}  {time.perf_counter() - start:.1f}s", flush=True)
 

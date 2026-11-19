@@ -22,7 +22,14 @@ def attention(q, k, v, causal=False, dropout_p=0.0, backend="cudnn"):
     q = q.transpose(1, 2).to(torch.bfloat16)
     k = k.transpose(1, 2).to(torch.bfloat16)
     v = v.transpose(1, 2).to(torch.bfloat16)
-    if backend == "auto":
+    if q.device.type == "mps":
+        # MPS caches one MPSGraph per input shape together with its FP32 score buffer, and
+        # the self-attention prefix grows every frame (21 shapes): all heads at once retains
+        # ~68 GiB, one head per call ~6 GiB, and is also slightly faster.
+        out = torch.cat([F.scaled_dot_product_attention(q[:, h:h + 1], k[:, h:h + 1], v[:, h:h + 1],
+                                                        is_causal=causal, dropout_p=dropout_p)
+                         for h in range(q.shape[1])], dim=1)
+    elif backend == "auto" or not q.is_cuda:
         out = F.scaled_dot_product_attention(q, k, v, is_causal=causal, dropout_p=dropout_p)
     else:
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):

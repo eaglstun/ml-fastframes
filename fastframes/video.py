@@ -10,6 +10,11 @@ are absent.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import numpy as np
 
 from . import mp4, openh264
@@ -134,12 +139,30 @@ def sps_color(sps):
     return matrix, full_range
 
 
+def _save_video_ffmpeg(path, frames, fps, qp):
+    """Fallback writer off Linux (the bundled OpenH264 binary is linux64): ffmpeg + libx264,
+    BT.601 limited range, faststart."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = frames.shape[1:3]
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+           "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+           "-c:v", "libx264", "-qp", str(qp), "-pix_fmt", "yuv420p",
+           "-vf", "scale=out_color_matrix=bt601:out_range=tv",
+           "-colorspace", "smpte170m", "-color_primaries", "smpte170m", "-color_trc", "smpte170m",
+           "-color_range", "tv", "-movflags", "+faststart", str(path)]
+    subprocess.run(cmd, input=np.ascontiguousarray(frames).tobytes(), check=True)
+    return path
+
+
 def save_video(path, frames, fps=16, *, qp=DEFAULT_QP):
     """Write ``[T, H, W, 3]`` uint8 RGB frames (numpy or CPU tensor) as a faststart H.264 MP4."""
     frames = np.asarray(frames)
     if frames.ndim != 4 or frames.shape[-1] != 3 or frames.dtype != np.uint8 or not len(frames):
         raise ValueError(f"expected [T, H, W, 3] uint8 frames, got {frames.shape} {frames.dtype}")
     height, width = frames.shape[1:3]
+    if sys.platform != "linux" and not os.environ.get("OPENH264_LIBRARY"):
+        return _save_video_ffmpeg(path, frames, fps, qp)
     access_units = []
     with openh264.Encoder(width, height, fps, qp=qp) as encoder:
         for frame in frames:

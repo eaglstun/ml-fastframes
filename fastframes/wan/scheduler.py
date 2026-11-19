@@ -4,6 +4,8 @@
 # Licensed under the Apache License, Version 2.0; see ACKNOWLEDGEMENTS.
 import torch
 
+from ..device import f64_device
+
 __all__ = ["FlowMatchScheduler"]
 
 
@@ -52,16 +54,16 @@ class FlowMatchScheduler:
 
     def flow_to_x0(self, flow, xt, timestep):
         """``x0 = x_t - sigma_t * flow`` in float64; inputs ``[N, C, H, W]``, timestep ``[N]``."""
-        dtype = flow.dtype
+        dtype, device = flow.dtype, flow.device
         flow, xt, sigmas, timesteps = (
-            x.double().to(flow.device) for x in (flow, xt, self.sigmas, self.timesteps))
-        sigma = sigmas[self._index(timestep, timesteps)].reshape(-1, 1, 1, 1)
-        return (xt - sigma * flow).to(dtype)
+            x.to(f64_device(flow.device)).double() for x in (flow, xt, self.sigmas, self.timesteps))
+        sigma = sigmas[self._index(timestep.to(sigmas.device), timesteps)].reshape(-1, 1, 1, 1)
+        return (xt - sigma * flow).to(device, dtype)
 
     def x0_to_flow(self, x0, xt, timestep):
         """``flow = (x_t - x0) / sigma_t`` in float64."""
-        dtype = x0.dtype
+        dtype, device = x0.dtype, x0.device
         x0, xt, sigmas, timesteps = (
-            x.double().to(x0.device) for x in (x0, xt, self.sigmas, self.timesteps))
-        sigma = sigmas[self._index(timestep, timesteps)].reshape(-1, 1, 1, 1)
-        return ((xt - x0) / sigma).to(dtype)
+            x.to(f64_device(x0.device)).double() for x in (x0, xt, self.sigmas, self.timesteps))
+        sigma = sigmas[self._index(timestep.to(sigmas.device), timesteps)].reshape(-1, 1, 1, 1)
+        return ((xt - x0) / sigma).to(device, dtype)
