@@ -33,10 +33,11 @@ __all__ = ["KVRefinementNetwork"]
 
 def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
     half = dim // 2
-    position = position.type(torch.float64)
+    device = position.device
+    position = position.to("cpu" if device.type == "mps" else device).to(torch.float64)
     div = torch.arange(half, dtype=torch.float64, device=position.device).div(half)
     sinusoid = torch.outer(position, torch.pow(10000.0, -div))
-    return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1).float()
+    return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1).float().to(device)
 
 
 def _sdpa(q, k, v):

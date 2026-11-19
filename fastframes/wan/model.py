@@ -7,6 +7,8 @@ import math
 from dataclasses import dataclass
 
 import torch
+
+from ..device import f64_device, on_mps
 import torch.nn as nn
 
 from .attention import attention, cross_attention
@@ -28,10 +30,12 @@ __all__ = [
 def sinusoidal_embedding_1d(dim, position):
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64)
+    device = position.device
+    position = position.to(f64_device(device)).to(torch.float64)
     sinusoid = torch.outer(
         position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
-    return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    out = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    return out.to(device, torch.float32) if on_mps(device) else out
 
 
 def rope_params(max_seq_len, dim, theta=10000):
@@ -44,6 +48,8 @@ def rope_params(max_seq_len, dim, theta=10000):
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     """3-D RoPE on ``[B, L, H, D]`` tokens whose first frame is ``start_frame``."""
+    if on_mps(x.device):
+        return _causal_rope_apply_fp32(x, grid_sizes, freqs, start_frame)
     n, c = x.size(2), x.size(3) // 2
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
     output = []
@@ -58,6 +64,34 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
         ], dim=-1).reshape(seq_len, 1, -1)
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
         output.append(torch.cat([x_i, x[i, seq_len:]]))
+    return torch.stack(output).type_as(x)
+
+
+_ROPE_TABLES = {}
+
+
+def _causal_rope_apply_fp32(x, grid_sizes, freqs, start_frame=0):
+    """``causal_rope_apply`` for devices without complex128 (MPS): the complex128
+    table is built on the CPU once per (frame, grid) and applied as FP32 rotations."""
+    n, c = x.size(2), x.size(3) // 2
+    output = []
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+        seq_len = f * h * w
+        key = (id(freqs), start_frame, f, h, w, str(x.device))
+        table = _ROPE_TABLES.get(key)
+        if table is None:
+            parts = freqs.cpu().split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+            fi = torch.cat([
+                parts[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                parts[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                parts[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+            ], dim=-1).reshape(seq_len, 1, -1)
+            table = _ROPE_TABLES[key] = torch.view_as_real(fi).float().contiguous().to(x.device)
+        pairs = x[i, :seq_len].float().reshape(seq_len, n, c, 2)
+        real, imag = pairs[..., 0], pairs[..., 1]
+        cos, sin = table[..., 0], table[..., 1]
+        rotated = torch.stack((real * cos - imag * sin, real * sin + imag * cos), dim=-1).flatten(2)
+        output.append(torch.cat([rotated, x[i, seq_len:].float()]))
     return torch.stack(output).type_as(x)
 
 
@@ -292,7 +326,7 @@ class WanModel(WanBackbone):
     def forward(self, x, t, context, seq_len):
         """x: ``[B, C, F, H, W]``; t: ``[B]``; context: T5 embeddings ``[B, L, 4096]``."""
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
+        if self.freqs.device != device and not on_mps(device):
             self.freqs = self.freqs.to(device)
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from ..device import f64_device, on_mps
 from .attention import attention
 from .model import (
     Head,
@@ -108,7 +109,8 @@ class FastOps:
             self.qkv.append((weight, bias))
         h, w = height // model.patch_size[1], width // model.patch_size[2]
         half = model.dim // model.num_heads // 2
-        model.freqs = model.freqs.to(patch.weight.device)
+        device = patch.weight.device
+        model.freqs = model.freqs.to(f64_device(device))
         temporal, vertical, horizontal = model.freqs.split(
             [half - 2 * (half // 3), half // 3, half // 3], dim=1)
         self.rope = [
@@ -116,7 +118,7 @@ class FastOps:
                 temporal[f:f + 1].view(1, 1, 1, -1).expand(1, h, w, -1),
                 vertical[:h].view(1, h, 1, -1).expand(1, h, w, -1),
                 horizontal[:w].view(1, 1, w, -1).expand(1, h, w, -1),
-            ), dim=-1).reshape(h * w, 1, half)).float().contiguous()
+            ), dim=-1).reshape(h * w, 1, half)).float().contiguous().to(device)
             for f in range(num_frames)
         ]
 
@@ -271,7 +273,7 @@ class CausalWanModel(WanBackbone):
         prediction ``[B, F, 16, H, W]``; with ``return_kv`` also the per-layer
         ``(k, v)`` of the clip (the KV cache of a clean prefix, for DMD rollouts).
         """
-        if self.freqs.device != x.device:
+        if self.freqs.device != x.device and not on_mps(x.device):
             self.freqs = self.freqs.to(x.device)
         b, num_frames, _, height, width = x.shape
         grid_sizes = torch.tensor([[num_frames, height // 2, width // 2]] * b, dtype=torch.long)
@@ -313,7 +315,7 @@ class CausalWanModel(WanBackbone):
         ``forward_frame`` with the KV cache replaced by ``context_kv``. Returns the
         flow ``[B, 1, 16, H, W]`` and this frame's per-layer ``(k, v)``.
         """
-        if self.freqs.device != latent.device:
+        if self.freqs.device != latent.device and not on_mps(latent.device):
             self.freqs = self.freqs.to(latent.device)
         b, _, _, height, width = latent.shape
         x = self.patch_embedding(latent.permute(0, 2, 1, 3, 4)).flatten(2).transpose(1, 2)
@@ -334,7 +336,7 @@ class CausalWanModel(WanBackbone):
         Returns the flow prediction ``[B, 1, 16, H, W]`` and the pre-head hidden
         states ``[B, H*W/4, C]`` consumed by the pixel decoder.
         """
-        if self.freqs.device != latent.device:
+        if self.freqs.device != latent.device and not on_mps(latent.device):
             self.freqs = self.freqs.to(latent.device)
         b, _, _, height, width = latent.shape
         if fast is None:

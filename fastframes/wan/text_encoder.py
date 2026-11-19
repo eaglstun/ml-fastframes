@@ -18,9 +18,14 @@ class TextEncoder(nn.Module):
     def __init__(self, wan_dir, text_len=512):
         super().__init__()
         wan_dir = Path(wan_dir)
-        self.text_encoder = umt5_xxl_encoder().eval().requires_grad_(False)
+        # Built on the meta device and assigned the BF16 checkpoint tensors directly: random FP32
+        # initialisation of the 5.7B encoder took ~48 s and 22 GB of RAM. Inference casts the
+        # encoder to BF16, so the result is identical to loading into an FP32 model.
+        self.text_encoder = umt5_xxl_encoder(device="meta").eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load(wan_dir / "models_t5_umt5-xxl-enc-bf16.pth", map_location="cpu", weights_only=True))
+            torch.load(wan_dir / "models_t5_umt5-xxl-enc-bf16.pth", map_location="cpu", mmap=True,
+                       weights_only=True), assign=True)
+        self.text_encoder.requires_grad_(False)
         self.tokenizer = HuggingfaceTokenizer(
             name=str(wan_dir / "google" / "umt5-xxl"), seq_len=text_len, clean="whitespace",
             local_files_only=True)

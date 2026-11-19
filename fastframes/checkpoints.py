@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 
+from .device import default_device
 from .wan.causal_model import CausalWanModel
 from .wan.model import WAN_CONFIGS, WanModel
 
@@ -44,8 +45,9 @@ def _strip(name):
     return name
 
 
-def build_wan(name, state_dict, *, causal=True, dtype=torch.bfloat16, device="cuda"):
+def build_wan(name, state_dict, *, causal=True, dtype=torch.bfloat16, device=None):
     """Instantiate a (causal) Wan2.1 transformer without materialising random weights."""
+    device = device or default_device()
     cls = CausalWanModel if causal else WanModel
     with torch.device("meta"):
         model = cls(WAN_CONFIGS[name])
@@ -53,7 +55,7 @@ def build_wan(name, state_dict, *, causal=True, dtype=torch.bfloat16, device="cu
     return model.to(device=device, dtype=dtype).eval().requires_grad_(False)
 
 
-def load_wan_base(wan_dir, *, causal=False, dtype=torch.bfloat16, device="cuda"):
+def load_wan_base(wan_dir, *, causal=False, dtype=torch.bfloat16, device=None):
     """Load the released Wan2.1 weights (``diffusion_pytorch_model*.safetensors``)."""
     from safetensors.torch import load_file
     wan_dir = Path(wan_dir)
