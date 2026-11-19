@@ -28,19 +28,27 @@ def _worker(rank, config, commands, replies, rendezvous):
 
     from apps.lingbot.conditioning import KeyboardCamera, LiveCamera
     from apps.lingbot.pipeline import FastFramesLingBot, configure_backends
+    from fastframes.device import default_device, synchronize
 
     pipe = None
+    device = default_device()
+    cuda = device.type == "cuda"
+
     world = config["gpus"]
     fingerprint = None
     try:
-        torch.cuda.set_device(rank)
+        if world > 1 and not cuda:
+            raise RuntimeError("multi-GPU LingBot needs CUDA")
+        if cuda:
+            torch.cuda.set_device(rank)
         configure_backends()
         if world > 1:
             from datetime import timedelta
 
             dist.init_process_group("nccl", init_method=rendezvous, world_size=world, rank=rank,
                                     timeout=timedelta(minutes=10), device_id=torch.device("cuda", rank))
-        torch.cuda.reset_peak_memory_stats()
+        if cuda:
+            torch.cuda.reset_peak_memory_stats()
         keys = camera = None
         while True:
             request = commands.get()  # No GPU collective is pending during user idle.
@@ -56,8 +64,9 @@ def _worker(rank, config, commands, replies, rendezvous):
                         lingbot_checkpoint=config.get("lingbot_checkpoint") or
                         root / "lingbot-world-v2-1.3b-causal-fast",
                         assets_dir=config.get("assets_dir") or root / "lingbot-world-v2-14b-causal-fast",
-                        checkpoint_dir=root / "lingbot-1.3b", world=world, rank=rank)
-                    keys, camera = KeyboardCamera(), LiveCamera()
+                        checkpoint_dir=root / "lingbot-1.3b", world=world, rank=rank,
+                        compile=cuda, graphs=cuda)  # torch.compile/CUDA graphs are CUDA-only here
+                    keys, camera = KeyboardCamera(), LiveCamera(device=device)
                 next_fingerprint = (hashlib.sha256(request["image"]).hexdigest(), request["prompt"])
                 if fingerprint == next_fingerprint:
                     pipe.restart(seed=request["seed"])
@@ -65,7 +74,8 @@ def _worker(rank, config, commands, replies, rendezvous):
                     with Image.open(io.BytesIO(request["image"])) as image:
                         pipe.start(image.convert("RGB"), request["prompt"], seed=request["seed"],
                                    latents=LATENTS, noise="chunk")
-                if fingerprint is None:
+                if fingerprint is None and cuda:
+                    # Eager off CUDA: nothing to compile or capture, so no warm-up chunks.
                     # Visit every cache length and both cold/steady decoder shapes twice.
                     for _ in range(2):
                         keys.reset()
@@ -80,10 +90,10 @@ def _worker(rank, config, commands, replies, rendezvous):
                 action = request["action"]
                 if action not in ACTIONS:
                     raise ValueError(f"Unknown camera action: {action}")
-                torch.cuda.synchronize()
+                synchronize(device)
                 start = time.perf_counter()
                 frames = pipe.step(camera.rays(keys.chunk(action)))
-                torch.cuda.synchronize()
+                synchronize(device)
                 model_ms = (time.perf_counter() - start) * 1000
                 if world > 1:
                     timing = torch.tensor(model_ms, device="cuda", dtype=torch.float64)
@@ -103,14 +113,22 @@ def _worker(rank, config, commands, replies, rendezvous):
                 pass
             else:
                 raise ValueError(f"Unknown worker operation: {op}")
-            torch.cuda.synchronize()
-            memory = {"rank": rank, "gpu": torch.cuda.get_device_name(),
-                      "allocated_bytes": torch.cuda.memory_allocated(),
-                      "reserved_bytes": torch.cuda.memory_reserved(),
-                      "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-                      "peak_reserved_bytes": torch.cuda.max_memory_reserved()}
+            synchronize(device)
+            if cuda:
+                memory = {"rank": rank, "gpu": torch.cuda.get_device_name(),
+                          "allocated_bytes": torch.cuda.memory_allocated(),
+                          "reserved_bytes": torch.cuda.memory_reserved(),
+                          "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+                          "peak_reserved_bytes": torch.cuda.max_memory_reserved()}
+            else:  # MPS has no peak counters: report the current values
+                allocated = torch.mps.current_allocated_memory() if device.type == "mps" else 0
+                reserved = torch.mps.driver_allocated_memory() if device.type == "mps" else 0
+                memory = {"rank": rank, "gpu": f"Apple Silicon ({device.type})", "allocated_bytes": allocated,
+                          "reserved_bytes": reserved, "peak_allocated_bytes": allocated,
+                          "peak_reserved_bytes": reserved}
             replies.put({"rank": rank, "result": result, "memory": memory})
-            torch.cuda.reset_peak_memory_stats()
+            if cuda:
+                torch.cuda.reset_peak_memory_stats()
     except BaseException:
         replies.put({"rank": rank, "error": traceback.format_exc()})
     finally:
