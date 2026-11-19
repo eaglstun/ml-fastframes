@@ -173,8 +173,10 @@ def _body(D, H, RT, NK):
     return "\n".join(o) + "\n"
 
 
-# (row tiles, key tiles): 16 query rows per SIMD-group, 32 keys per online-softmax step.
-_DEFAULT_TILING = (2, 4)
+# (row tiles, key tiles): 16 query rows per SIMD-group, 24 keys per online-softmax step.  Measured on
+# an M4 Max: RT=2 is the most that stays in registers (RT>=3 is ~1.6x slower), NK=3 beats 1, 2, 4.
+MIN_QUERY_ROWS = 16
+_DEFAULT_TILING = (2, 3)
 _libs = {}
 _mapping_ok = None
 

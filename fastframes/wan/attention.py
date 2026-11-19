@@ -3,13 +3,21 @@
 # Licensed under the Apache License, Version 2.0; see ACKNOWLEDGEMENTS.
 # Modified for FastFrames: attention uses PyTorch SDPA with the cuDNN backend
 # (fastest on B200; PyTorch would otherwise auto-select FLASH).
+import os
+
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from . import mps_flash_attention
+
 __all__ = ["attention", "cross_attention", "set_cross_attention_backend"]
 
 _cross_attention_backend = "cudnn"
+# MPS only: "flash" (Metal kernel in mps_flash_attention.py, default) or "sdpa" (PyTorch, per head).
+_MPS_ATTN = os.environ.get("FASTFRAMES_MPS_ATTN", "flash").lower()
+if _MPS_ATTN not in ("flash", "sdpa"):
+    raise ValueError(f"FASTFRAMES_MPS_ATTN must be 'flash' or 'sdpa', got {_MPS_ATTN!r}")
 
 
 def attention(q, k, v, causal=False, dropout_p=0.0, backend="cudnn"):
@@ -19,6 +27,12 @@ def attention(q, k, v, causal=False, dropout_p=0.0, backend="cudnn"):
     ``[B, L, H, D]`` in the dtype of ``q``.
     """
     out_dtype = q.dtype
+    if (q.device.type == "mps" and _MPS_ATTN == "flash" and not causal and dropout_p == 0.0
+            and q.shape[1] >= mps_flash_attention.MIN_QUERY_ROWS and mps_flash_attention.is_available(q.shape[-1])):
+        # One Metal kernel with online softmax, straight on the [B, L, H, D] layout: ~2x faster than
+        # MPS SDPA and nothing is cached per shape.  FASTFRAMES_MPS_ATTN=sdpa selects the path below.
+        return mps_flash_attention.flash_attention(
+            q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)).to(out_dtype)
     q = q.transpose(1, 2).to(torch.bfloat16)
     k = k.transpose(1, 2).to(torch.bfloat16)
     v = v.transpose(1, 2).to(torch.bfloat16)
