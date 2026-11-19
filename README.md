@@ -5,6 +5,12 @@
 [![FastFrames-S](https://img.shields.io/badge/%F0%9F%A4%97_Model-FastFrames--S-yellow)](https://huggingface.co/apple/FastFrames-S)
 [![FastFrames-L](https://img.shields.io/badge/%F0%9F%A4%97_Model-FastFrames--L-yellow)](https://huggingface.co/apple/FastFrames-L)
 
+> **This fork adds Apple Silicon (MPS) support for FastFrames-S text-to-video.** It runs on an
+> M4 Max at ~63 s per 81-frame 480p video with ~20 GB peak memory. See
+> [Apple Silicon](#apple-silicon-mps) and [MAC.md](MAC.md). Everything else is upstream
+> [apple-aiml-research/ml-fastframes](https://github.com/apple-aiml-research/ml-fastframes) and
+> still targets Linux + NVIDIA.
+
 This repository contains the official implementation of *FastFrames: Video Generation at
 Interactive Latency*. We release [FastFrames-S](https://huggingface.co/apple/FastFrames-S)
 (1.3B) and [FastFrames-L](https://huggingface.co/apple/FastFrames-L) (14B). Both are
@@ -30,6 +36,36 @@ uv sync
 ```
 
 Download FastFrames and third-party weights using the [checkpoint guide](docs/installation.md#checkpoints).
+
+### Apple Silicon (MPS)
+
+FastFrames-S T2V inference runs on Apple Silicon Macs through PyTorch MPS. Don't run `uv sync`
+on a Mac, because `pyproject.toml` pins the CUDA wheels. Use a separate venv instead (needs
+`ffmpeg` with libx264 on `PATH`):
+
+```bash
+uv venv .venv --python 3.12
+uv pip install -p .venv/bin/python "torch==2.9.1" "torchvision==0.24.1" "transformers>=5.10" \
+    safetensors einops ftfy regex pyyaml numpy huggingface_hub
+HF=.venv/bin/hf
+$HF download apple/FastFrames-S --include 'fastframes-s/*' --local-dir checkpoints
+$HF download zhuhz22/Causal-Forcing causal-forcing++/framewise-2step.pt --local-dir checkpoints
+$HF download Wan-AI/Wan2.1-T2V-1.3B --exclude 'diffusion_pytorch_model*' --local-dir checkpoints/Wan2.1-T2V-1.3B
+
+.venv/bin/python scripts/generate.py --model ff-s --checkpoint-dir checkpoints \
+    --prompt "A corgi surfing a wave at sunset" --seed 0 --output outputs/corgi.mp4
+```
+
+| M4 Max, 64 GB             |                               |
+| ------------------------- | ----------------------------- |
+| model load                | ~5 s                          |
+| rollout, 21 latent frames | ~63 s (~3 s per latent frame) |
+| peak memory               | ~20 GB                        |
+
+This is batch generation, not interactive latency: the rollout is compute-bound, about 100×
+below the B200 numbers above. Training, latency profiling, the LingBot demo, and FastFrames-L
+(14B, doesn't fit in 64 GB without offloading) are not ported. [MAC.md](MAC.md) lists every
+change and why.
 
 ## Latency Profiling
 
