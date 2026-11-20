@@ -80,6 +80,13 @@ There are no unit tests for the inference path. Verify a change by:
   passes that feed them are gated on `device.type == "cuda"`. Verify the demo with a scripted
   websocket client (`start`, then `action` / `displayed` messages) and time a *second* session:
   the first one includes Metal shader compiles.
+- **Never let an MPS job outgrow memory.** MPS swaps past 1.7x its working set by default, and a
+  run that outgrew memory stalled the Mac into a watchdog panic (reboot). Long or large jobs
+  call `device.limit_mps_memory()` first; the latency profilers do. Shut down other GPU jobs (a
+  leftover demo server holds 13+ GB) before benchmarking. Pipelines on MPS release allocator
+  blocks with `device.release_mps_cache()` (sync + `empty_cache()`) per frame/chunk.
+- **Latency profiling** (`evaluation/latency`, `apps/lingbot/latency.py`) runs on one MPS device:
+  wall-clock timing, eager, Metal flash attention. Numbers are in `MAC.md#latency-benchmarks`.
 - Measured dead ends: `fast_ops` (fused QKV) is slower on MPS, and fp16 is slower than bf16 on
   M4. cuDNN SDPA is CUDA-only; on other devices `attention()` falls through to plain SDPA.
 

@@ -33,6 +33,7 @@ import torch.distributed as dist
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+from fastframes.device import default_device, device_name, limit_mps_memory, synchronize  # noqa: E402
 
 
 # --------------------------------------------------------------------------- distributed
@@ -43,8 +44,14 @@ class Dist:
         self.world = int(os.environ.get("WORLD_SIZE", "1"))
         self.rank = int(os.environ.get("RANK", "0"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        self.device = torch.device("cuda", self.local_rank)
-        torch.cuda.set_device(self.device)
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda", self.local_rank)
+            torch.cuda.set_device(self.device)
+        else:  # Apple Silicon (MPS) or CPU: one device, wall-clock timing
+            if self.world > 1:
+                raise RuntimeError("multi-device profiling needs CUDA")
+            self.device = default_device()
+            limit_mps_memory()  # fail with out-of-memory instead of swapping the machine into a stall
         self.group_name = None
         if self.world > 1:
             dist.init_process_group("nccl", device_id=self.device)
@@ -122,19 +129,27 @@ def _stats(samples):
 
 def measure(fn, ctx: Dist, *, warmup=16, iters=60, seconds=60.0, batch_ms=1000.0):
     """Time ``fn`` (one component call) with the protocol described in the module docstring."""
+    cuda = ctx.device.type == "cuda"
     for _ in range(warmup):
         fn()
-    torch.cuda.synchronize()
+    synchronize(ctx.device)
     ctx.barrier()
 
     events = []
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    if cuda:
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     for _ in range(iters):
-        start.record()
-        fn()
-        end.record()
-        end.synchronize()
-        events.append(start.elapsed_time(end))
+        if cuda:
+            start.record()
+            fn()
+            end.record()
+            end.synchronize()
+            events.append(start.elapsed_time(end))
+        else:  # no CUDA events: synchronized wall time of one call
+            t0 = time.perf_counter()
+            fn()
+            synchronize(ctx.device)
+            events.append((time.perf_counter() - t0) * 1000.0)
 
     # Identical batch sizes and stop decisions on every rank keep collectives matched.
     repeats = max(1, round(batch_ms / max(statistics.median(events), 1e-3)))
@@ -145,12 +160,12 @@ def measure(fn, ctx: Dist, *, warmup=16, iters=60, seconds=60.0, batch_ms=1000.0
         keep_going = ctx.broadcast(time.perf_counter() < deadline or not sustained)
         if not keep_going:
             break
-        torch.cuda.synchronize()
+        synchronize(ctx.device)
         ctx.barrier()
         t0 = time.perf_counter()
         for _ in range(repeats):
             fn()
-        torch.cuda.synchronize()
+        synchronize(ctx.device)
         sustained.append((time.perf_counter() - t0) * 1000.0 / repeats)
         if seconds <= 0:
             break
@@ -161,7 +176,8 @@ def measure(fn, ctx: Dist, *, warmup=16, iters=60, seconds=60.0, batch_ms=1000.0
         "sustained": _stats(sustained),
         "sustained_samples_ms": sustained,
         "repeats_per_batch": repeats,
-        "max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9,
+        **({"max_allocated_gb": torch.cuda.max_memory_allocated() / 1e9} if cuda else
+           {"driver_allocated_gb": torch.mps.driver_allocated_memory() / 1e9} if ctx.device.type == "mps" else {}),
     }
     ranks = ctx.gather(local)
     return {
@@ -175,6 +191,9 @@ def measure(fn, ctx: Dist, *, warmup=16, iters=60, seconds=60.0, batch_ms=1000.0
 
 # --------------------------------------------------------------------------- output
 def environment(ctx: Dist):
+    if ctx.device.type != "cuda":
+        return {"python": platform.python_version(), "torch": torch.__version__, "device": ctx.device.type,
+                "gpu": device_name(ctx.device), "world_size": ctx.world, "platform": platform.platform()}
     try:
         clocks = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,name,clocks.sm,power.draw,temperature.gpu",

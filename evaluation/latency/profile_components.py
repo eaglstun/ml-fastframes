@@ -20,7 +20,7 @@ import time
 import torch
 from dit import FrameDiT, Geometry
 from models import MODEL_DEFAULTS, load_dit, tuned_split_kv
-from timing import Dist, environment, measure, write_json
+from timing import Dist, environment, measure, synchronize, write_json
 
 # Timing defaults per component (warm-up calls, CUDA-event samples, sustained seconds, batch length).
 TIMING = {
@@ -123,7 +123,10 @@ def profile_dit(args, ctx, record):
     timestep = defaults["timestep"] if args.timestep is None else args.timestep
     tuned = tuned_split_kv(args.model, args.resolution, ctx.world)
     split = args.split_kv or (tuned if args.mode == "optimized" else 1)
-    compile_mode = args.compile_mode or ("max-autotune-no-cudagraphs" if args.mode == "optimized" else "default")
+    cuda = ctx.device.type == "cuda"
+    # max-autotune and CUDA graphs are CUDA-only; elsewhere the default is eager (--compile-mode overrides)
+    compile_mode = args.compile_mode or (("max-autotune-no-cudagraphs" if args.mode == "optimized" else "default")
+                                         if cuda else "none")
     compile_mode = None if compile_mode == "none" else compile_mode
     if args.mode == "optimized":
         import torch._inductor.config as inductor_config
@@ -132,14 +135,14 @@ def profile_dit(args, ctx, record):
     geometry = Geometry.from_resolution(args.resolution, args.frames)
     dit = FrameDiT(model, geometry, mode=args.mode, chunk=args.chunk, split_kv=split, rank=ctx.rank,
                    world=ctx.world, group_name=ctx.group_name, compile_mode=compile_mode,
-                   cuda_graph=not args.no_cuda_graph)
+                   cuda_graph=not args.no_cuda_graph and cuda)
     dit.fill_cache(seed=args.seed + 1)
     dit.set_inputs(timestep=timestep, seed=args.seed)
     started = time.perf_counter()
     dit.prepare(barrier=ctx.barrier)
     record["prepare_seconds"] = time.perf_counter() - started
     out = dit()
-    torch.cuda.synchronize()
+    synchronize(ctx.device)
     record["settings"] = dict(mode=args.mode, timestep=timestep, chunk=args.chunk, split_kv=split,
                               split_kv_is_tuned_default=split == tuned,
                               compile_mode=compile_mode, cuda_graph=dit.graph is not None,
@@ -174,7 +177,7 @@ def main():
     if fn is not None:
         record["timing"] = measure(fn, ctx, **timing_kwargs(args, args.component))
         record["latency_ms"] = record["timing"]["latency_ms"]
-        torch.cuda.synchronize()
+        synchronize(ctx.device)
         if getattr(fn, "graph", None) is not None:
             fn.graph.reset()  # release graphs that captured NCCL work before the process group
         del fn

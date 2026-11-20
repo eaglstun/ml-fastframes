@@ -56,13 +56,19 @@ def components(args):
     if args.gpus > 1:
         kv = ["--shard", "tokens" if model == "1.3b" else "layers"]
     else:
-        kv = ["--streams", "6"] if model == "1.3b" else []
+        # CUDA streams for the 1.3B refinement heads; elsewhere the heads run as one call
+        kv = ["--streams", "6"] if model == "1.3b" and _cuda() else []
     return [("DiT evaluation, t=1000", 1, "profile_components.py", ["dit", *dit, "--timestep", "1000"], "dit_t1000"),
             ("DiT evaluation, t=833", 1, "profile_components.py", ["dit", *dit], "dit_t833"),
             ("KV refinement", 1, "profile_components.py",
              ["kv-refine", *dit, "--refiner", str(root / spec.refiner), *kv], "kv_refine"),
             ("pixel decoder", 1, "profile_components.py",
              ["pixel-decoder", "--model", model, "--decoder", str(root / spec.decoder)], "pixel_decoder")]
+
+
+def _cuda():
+    import torch
+    return torch.cuda.is_available()
 
 
 def run(script, arguments, output, gpus):
@@ -101,7 +107,9 @@ def main():
 
     frames = "three latent frames (12 video frames)" if args.method == "self-forcing" else \
         "one latent frame (4 video frames)"
-    print(f"\n{NAMES[args.method]}, {args.gpus} GPU{'s' if args.gpus > 1 else ''}, 480p: "
+    device = "" if _cuda() else f" ({json.loads((out / 'dit_t833.json').read_text())['environment']['gpu']}" \
+        ", MPS)" if (out / "dit_t833.json").exists() else ""
+    print(f"\n{NAMES[args.method]}, {args.gpus} GPU{'s' if args.gpus > 1 else ''}{device}, 480p: "
           f"latency of one step, {frames}")
     for label, count, ms in rows:
         print(f"  {count} x {label:32s} {ms:7.2f} ms  {count * ms:8.2f} ms")

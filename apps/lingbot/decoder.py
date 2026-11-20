@@ -19,10 +19,10 @@ from __future__ import annotations
 import math
 
 import torch
-
-from fastframes.device import synchronize
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from fastframes.device import synchronize
 
 from .conditioning import CHUNK
 from .dit import GRID_H, GRID_W

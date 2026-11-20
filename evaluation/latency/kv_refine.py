@@ -29,11 +29,15 @@ import time
 
 import torch
 import torch.distributed as dist
-import triton
-import triton.language as tl
 from dit import Geometry
 from models import MODEL_DEFAULTS, load_refiner
-from timing import capture_graph, compare
+from timing import capture_graph, compare, synchronize
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # no Triton off CUDA (macOS); only the multi-GPU commit kernel needs it
+    triton = None
 
 from fastframes.checkpoints import load_state_dict
 from fastframes.wan.model import WAN_CONFIGS
@@ -43,7 +47,6 @@ __all__ = ["KVRefineRuntime", "profile_kv_refine"]
 COMMIT_BLOCK = 4096
 
 
-@triton.jit
 def _commit_kernel(gathered, destinations, LAYERS: tl.constexpr, LOCAL: tl.constexpr, TOKENS: tl.constexpr,
                    DIM: tl.constexpr, START: tl.constexpr, BY_TOKENS: tl.constexpr, BLOCK: tl.constexpr):
     """Copy one (K|V, layer) live slot from the all-gather buffer into its cache.
@@ -63,6 +66,10 @@ def _commit_kernel(gathered, destinations, LAYERS: tl.constexpr, LOCAL: tl.const
         source = ((layer // LOCAL * 2 + kv) * LOCAL + layer % LOCAL) * (TOKENS * DIM) + element
     destination = tl.cast(tl.load(destinations + kv_layer), tl.pointer_type(tl.int16))
     tl.store(destination + START * DIM + element, tl.load(gathered + source, mask=mask), mask=mask)
+
+
+if triton is not None:
+    _commit_kernel = triton.jit(_commit_kernel)
 
 
 def load_patch_embedding(model, path=None, device="cuda"):
@@ -117,6 +124,8 @@ class KVRefineRuntime:
                 self.local = self.layers // world
                 self.gathered = torch.empty(world, 2, self.local, tokens, self.dim, device=device,
                                             dtype=torch.bfloat16)
+        if streams > 1 and device.type != "cuda":
+            raise ValueError("--streams needs CUDA")
         self.streams = [torch.cuda.Stream(device) for _ in range(streams)] if streams > 1 else []
         assert streams == 1 or (world == 1 and self.layers % streams == 0), "streams need 1 GPU and equal groups"
         opts = {"max_autotune": True, "coordinate_descent_tuning": True, "triton.cudagraphs": False,
@@ -129,7 +138,7 @@ class KVRefineRuntime:
 
     def _autocast(self):
         if self.autocast:
-            return torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False)
+            return torch.autocast(self.device.type, dtype=torch.bfloat16, cache_enabled=False)
         return contextlib.nullcontext()
 
     # ------------------------------------------------------------------ stages
@@ -224,7 +233,7 @@ class KVRefineRuntime:
     def prepare(self, barrier=lambda: None):
         for _ in range(3):
             self.forward()
-        torch.cuda.synchronize()
+        synchronize(self.device)
         barrier()
         if self.cuda_graph:
             self.graph, _ = capture_graph(self.forward, before_capture=barrier)
@@ -239,6 +248,7 @@ class KVRefineRuntime:
 
 def profile_kv_refine(args, ctx, record):
     torch.backends.cudnn.benchmark = True
+    cuda = ctx.device.type == "cuda"
     defaults = MODEL_DEFAULTS[args.model]
     net = load_refiner(args.model, args.refiner, ctx.device)
     patch = load_patch_embedding(args.model, args.dit, ctx.device)
@@ -248,7 +258,9 @@ def profile_kv_refine(args, ctx, record):
     runtime = KVRefineRuntime(net, patch, geometry, timestep, autocast=defaults["refiner_autocast"],
                               contiguous_stem=defaults["contiguous_stem"], rank=ctx.rank, world=ctx.world,
                               shard=shard, streams=args.streams,
-                              compile_heads=not args.no_compile, cuda_graph=not args.no_cuda_graph)
+                              # max-autotune heads and CUDA graphs are CUDA-only: eager elsewhere
+                              compile_heads=not args.no_compile and cuda,
+                              cuda_graph=not args.no_cuda_graph and cuda)
     runtime.fill(seed=args.seed)
     started = time.perf_counter()
     runtime.prepare(barrier=ctx.barrier)
@@ -258,7 +270,7 @@ def profile_kv_refine(args, ctx, record):
         c["k"][:, runtime.live].fill_(float("nan"))
         c["v"][:, runtime.live].fill_(float("nan"))
     runtime()
-    torch.cuda.synchronize()
+    synchronize(ctx.device)
     got = runtime.committed()
     ref = runtime.reference()
     checks = {"key": compare(got[0], ref[0]), "value": compare(got[1], ref[1]),
@@ -267,7 +279,8 @@ def profile_kv_refine(args, ctx, record):
                   patch(runtime.latent.permute(0, 2, 1, 3, 4).contiguous()).flatten(2).transpose(1, 2).contiguous())}
     checks = ctx.gather(checks)
     record["settings"] = dict(timestep=timestep, autocast=defaults["refiner_autocast"], shard=shard if ctx.world > 1
-                              else None, streams=args.streams, compiled_heads=not args.no_compile,
+                              else None, streams=args.streams,
+                              compiled=bool(not args.no_compile and cuda),
                               cuda_graph=runtime.graph is not None, tokens=geometry.tokens, kv_len=geometry.kv_len,
                               refiner_weights=args.refiner or "random", patch_weights=args.dit or "random",
                               parameters=sum(p.numel() for p in net.parameters()))

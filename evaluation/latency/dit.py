@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from timing import capture_graph  # also puts the repository root on sys.path
+from timing import capture_graph, synchronize  # also puts the repository root on sys.path
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from fastframes.wan.attention import attention
@@ -77,7 +77,11 @@ def split_kv_attention(q, k, v, split, scale):
     processed as one batched cuDNN call; the partial outputs are merged with their
     log-sum-exp weights in FP32. This exposes more parallel work when ``Lq`` (one latent
     frame) is small relative to the cache.
+
+    Off CUDA ``split`` is ignored: ``fastframes.wan.attention`` (the Metal flash kernel on MPS).
     """
+    if not q.is_cuda:
+        return attention(q.transpose(1, 2), k, v).transpose(1, 2)
     if split == 1:
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
             return F.scaled_dot_product_attention(q, k.transpose(1, 2), v.transpose(1, 2))
@@ -105,7 +109,9 @@ def _rope(x, table):
 def rope_table(model, start_frame, num_frames, grid):
     """FP32 ``(cos, sin)`` table ``[F*h*w, 1, D/2, 2]`` for latent frames ``start_frame + [0, F)``."""
     h, w = grid
-    freqs = model.freqs.to(model.patch_embedding.weight.device)
+    device = model.patch_embedding.weight.device
+    # MPS has no complex128: the table is built where ``model.freqs`` lives (CPU there) and moved as FP32
+    freqs = model.freqs if device.type == "mps" else model.freqs.to(device)
     half = freqs.shape[1]
     t, y, x = freqs.split([half - 2 * (half // 3), half // 3, half // 3], dim=1)
     f = num_frames
@@ -114,7 +120,7 @@ def rope_table(model, start_frame, num_frames, grid):
         y[:h].view(1, h, 1, -1).expand(f, h, w, -1),
         x[:w].view(1, 1, w, -1).expand(f, h, w, -1),
     ), dim=-1).reshape(f * h * w, 1, half)
-    return torch.view_as_real(table).float().contiguous()
+    return torch.view_as_real(table).float().contiguous().to(device)
 
 
 def _native_block(block, x, e0, grid_sizes, freqs, start_frame, text, cache, live):
@@ -164,9 +170,13 @@ def _optimized_block(block, x, e0, key_cache, value_cache, text_k, text_v, qkv_w
     y = sa.o(y.transpose(1, 2).reshape(b, tokens, -1))
     x = x + (y.unsqueeze(1) * mod[2]).flatten(1, 2)
     cq = ca.norm_q(ca.q(block.norm3(x))).view(shape)
-    with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-        y = F.scaled_dot_product_attention(cq.transpose(1, 2), text_k.transpose(1, 2), text_v.transpose(1, 2))
-    x = x + ca.o(y.transpose(1, 2).reshape(b, tokens, -1))
+    if cq.is_cuda:
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            y = F.scaled_dot_product_attention(cq.transpose(1, 2), text_k.transpose(1, 2), text_v.transpose(1, 2))
+        y = y.transpose(1, 2)
+    else:  # [B, L, H, D] in and out (Metal flash kernel on MPS)
+        y = attention(cq, text_k, text_v)
+    x = x + ca.o(y.reshape(b, tokens, -1))
     y = block.ffn((block.norm2(x).unsqueeze(1) * (1 + mod[4]) + mod[3]).flatten(1, 2))
     return x + (y.unsqueeze(1) * mod[5]).flatten(1, 2)
 
@@ -256,7 +266,7 @@ class FrameDiT:
     # ------------------------------------------------------------------ baseline
     def _baseline_forward(self):
         m = self.model
-        if m.freqs.device != self.device:
+        if m.freqs.device != self.device and self.device.type != "mps":  # complex128 stays on CPU for MPS
             m.freqs = m.freqs.to(self.device)
         e0, e_head = m.time_conditioning(self.timestep, torch.bfloat16)
         x = m.patch_embedding(self.latent.permute(0, 2, 1, 3, 4)).flatten(2).transpose(1, 2)
@@ -318,7 +328,7 @@ class FrameDiT:
             fn = self._optimized_forward
         for _ in range(compile_warmup):
             fn()
-            torch.cuda.synchronize()
+            synchronize(self.device)
             barrier()
         self._fn = fn
         if self.mode == "optimized" and self.cuda_graph:
