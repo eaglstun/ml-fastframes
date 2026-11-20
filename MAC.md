@@ -180,8 +180,8 @@ cool-down, t=833 takes 1341 ms (then t=1000, 2 minutes later, 1406 ms). On a coo
 only ~1%.
 
 For comparison, the Wan VAE decode that the baselines use instead of the pixel decoder takes
-5.4 s per latent frame here (shorter run: two streamed passes, measured while Photos analysis
-was still busy), ~94x the pixel decoder.
+1.5 s per latent frame here with the conv2d path below (4.9 s with PyTorch's MPS `conv3d`; two
+streamed passes each, back to back), ~26x the pixel decoder.
 
 LingBot 1.3B, one chunk (16 frames, 1 s of video) with a full 18-frame cache: **25.9 s** median
 (16 chunks, range 25.3-26.4 s) against 220.7 ms on a B200. The run uses 16-chunk videos
@@ -214,6 +214,40 @@ per LingBot chunk: background GPU work inflates these by up to ~30%.
 
 Not ported: the multi-GPU rows (`--gpus 8`, NVLink symmetric memory), the 720p/14B rows, and the
 Causal Forcing++ / Self-Forcing baseline DiTs (`baselines.py`, needs their upstream clones).
+
+## Performance work: VAE convolutions, attention pipelining, condition prefetch
+
+Profiling a full-cache LingBot chunk and a FastFrames-S DiT step on the M4 Max found three wins.
+Background GPU work (Photos analysis) was running during most of these runs, so each number below
+is an A/B measured back to back or interleaved, not an absolute benchmark.
+
+- **Wan VAE 3D convolutions as per-tap `conv2d`** (`fastframes/wan/mps_conv3d.py`). MPS `conv3d`
+  runs the VAE's 3x3x3 layers at ~3.3 TFLOPS in every dtype; the same convolution written as the
+  sum over its temporal taps of batched `conv2d` calls runs at 13-16 TFLOPS in FP32 (same values to
+  ~1e-6 relative L2). Only `_conv_forward` of the Wan `CausalConv3d` classes is replaced (ours, and
+  the LingBot clone's at import), so causal padding and feature caches are unchanged.
+  `FASTFRAMES_MPS_CONV3D=native` restores `conv3d`.
+  - LingBot image condition: 3.19 s -> 0.95 s per black-frame latent, 4 latents per chunk. With
+    the kernel change below, a new world's first demo session went from 24.2 / 26.3 / 29.3 / 31.2 s
+    to 14.2 / 17.0 / 20.4 / 21.7 s for turns 1-4 (no prefetch).
+  - Wan VAE decode (baseline rows): 4.9 s -> 1.5 s per latent frame.
+  - Found on the way: MPS `conv2d` silently returns wrong results for a non-contiguous weight view
+    such as `weight[:, :, k]` (PyTorch 2.9.1). The per-tap weights are made contiguous once.
+- **Software-pipelined loads in the flash-attention kernel** (by Fable; details in the kernel
+  section above): 10.6 -> 12.7 TFLOPS at 1,560 x 32,760 and 11.8 -> 13.0 at LingBot's 6,032 x 27,144,
+  same error. Attention is ~70% of a FastFrames-S DiT step: one DiT evaluation went from 1294 to
+  1147 ms in a quiet run (-11%) and by 6% on average in four back-to-back pairs under load
+  (1325/1286, 1353/1249, 1554/1441, 1584/1478 ms). `latency.py`'s
+  LingBot chunk went from 25.9 s to 24.2 s (its timed chunks reuse a cached image condition, so it
+  doesn't see the VAE change).
+- **Condition prefetch in the demo** (`FastFramesLingBot.prefetch_condition`). The next chunk's VAE
+  condition doesn't depend on the camera action, so on MPS the demo worker encodes it right after
+  replying, while the player looks at the frames. Alternating full-cache chunks in one process:
+  26.3 s per step with the encode inline, 21.9 s prefetched. `LINGBOT_DEMO_PREFETCH=0` disables it.
+  The win shows when the player takes more than ~4 s between turns.
+
+What's left in a full-cache LingBot chunk is mostly attention (~60%) and GEMMs, which run at
+12.4-14.2 TFLOPS (MPS's own matmul), close to what this GPU does.
 
 ## What was changed for FastFrames-S (see `git diff`)
 

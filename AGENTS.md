@@ -87,6 +87,13 @@ There are no unit tests for the inference path. Verify a change by:
   blocks with `device.release_mps_cache()` (sync + `empty_cache()`) per frame/chunk.
 - **Latency profiling** (`evaluation/latency`, `apps/lingbot/latency.py`) runs on one MPS device:
   wall-clock timing, eager, Metal flash attention. Numbers are in `MAC.md#latency-benchmarks`.
+- **MPS `conv3d` is ~4x slower than per-tap `conv2d`** at the Wan VAE's shapes. Wan `CausalConv3d`
+  classes go through `fastframes/wan/mps_conv3d.py` on MPS (`FASTFRAMES_MPS_CONV3D=native` for A/B).
+  MPS `conv2d` gives **wrong results for non-contiguous weight views** (`w[:, :, k]`): always
+  pass contiguous weights.
+- **Benchmark A/B, not absolutes, when the Mac is busy.** Photos' `mediaanalysisd` and
+  VideoToolbox use the GPU after reboots and imports and move timings by 10-30%. Compare
+  variants back to back or interleaved in one process.
 - Measured dead ends: `fast_ops` (fused QKV) is slower on MPS, and fp16 is slower than bf16 on
   M4. cuDNN SDPA is CUDA-only; on other devices `attention()` falls through to plain SDPA.
 
