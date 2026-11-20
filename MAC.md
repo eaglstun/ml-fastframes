@@ -154,24 +154,31 @@ FastFrames-S, one step (one latent frame, 4 video frames) with a full 21-frame c
 
 | Component | M4 Max | B200 (README) |
 |---|---:|---:|
-| DiT evaluation, t=1000 | 1925.7 ms | 16.1 ms |
-| DiT evaluation, t=833 | 1893.4 ms | 16.2 ms |
-| KV refinement | 136.6 ms | 2.2 ms |
-| Pixel decoder | 57.2 ms | 0.9 ms |
-| **Total** | **4013 ms** | **35.4 ms** |
+| DiT evaluation, t=1000 | 1340.3 ms | 16.1 ms |
+| DiT evaluation, t=833 | 1676.8 ms | 16.2 ms |
+| KV refinement | 119.6 ms | 2.2 ms |
+| Pixel decoder | 57.4 ms | 0.9 ms |
+| **Total** | **3194 ms** | **35.4 ms** |
+
+The two DiT rows do the same work; the second is slower because `benchmark.py` runs the
+components back to back and the chip is hotter by then. Profiled alone after a 5-minute
+cool-down, t=833 takes 1341 ms (then t=1000, 2 minutes later, 1406 ms). On a cool chip a step is
+~2.9 s (2 x 1.34 s + 0.12 s + 0.06 s). Within one component's 60 s window the timing drifts by
+only ~1%.
 
 For comparison, the Wan VAE decode that the baselines use instead of the pixel decoder takes
-5.4 s per latent frame here (shorter run: two streamed passes), ~95x the pixel decoder.
+5.4 s per latent frame here (shorter run: two streamed passes, measured while Photos analysis
+was still busy), ~94x the pixel decoder.
 
-LingBot 1.3B, one chunk (16 frames, 1 s of video) with a full 18-frame cache: **27.1 s** median
-(16 chunks, range 25.6-28.1 s) against 220.7 ms on a B200. The run uses 16-chunk videos
+LingBot 1.3B, one chunk (16 frames, 1 s of video) with a full 18-frame cache: **25.9 s** median
+(16 chunks, range 25.3-26.4 s) against 220.7 ms on a B200. The run uses 16-chunk videos
 (`--frames 253`) and 16 samples instead of upstream's 60-chunk videos and 30 samples: a
 60-chunk pass takes ~25 minutes here. Eager mode has nothing to compile, so one warm-up pass
 is enough off CUDA.
 
-Both sets of numbers were measured right after a reboot, with Photos' `mediaanalysisd` busy in
-the background, and the sustained 60 s windows run warmer than short bursts: short runs measured
-1.38 s per DiT evaluation and 94 ms per refinement. Treat them as +-30%.
+Measured on an idle machine (no other GPU jobs, Photos analysis finished). A first run right
+after a reboot, with Photos' `mediaanalysisd` busy, gave 4013 ms per FastFrames-S step and 27.1 s
+per LingBot chunk: background GPU work inflates these by up to ~30%.
 
 - **Memory cap.** By default MPS may allocate 1.7x its recommended working set and then swaps.
   An early run of these profilers outgrew memory alongside a running demo server and stalled
