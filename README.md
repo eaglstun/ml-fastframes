@@ -5,8 +5,9 @@
 [![FastFrames-S](https://img.shields.io/badge/%F0%9F%A4%97_Model-FastFrames--S-yellow)](https://huggingface.co/apple/FastFrames-S)
 [![FastFrames-L](https://img.shields.io/badge/%F0%9F%A4%97_Model-FastFrames--L-yellow)](https://huggingface.co/apple/FastFrames-L)
 
-> **This fork adds Apple Silicon (MPS) support for FastFrames-S text-to-video.** It runs on an
-> M4 Max at ~45-50 s per 81-frame 480p video with ~18 GB peak memory. See
+> **This fork adds Apple Silicon (MPS) support for FastFrames-S text-to-video and the LingBot
+> camera-control demo.** On an M4 Max, T2V takes ~45-50 s per 81-frame 480p video with ~18 GB peak
+> memory, and the LingBot demo makes each 1 s turn in ~11-22 s. See
 > [Apple Silicon](#apple-silicon-mps) and [MAC.md](MAC.md). Everything else is upstream
 > [apple-aiml-research/ml-fastframes](https://github.com/apple-aiml-research/ml-fastframes) and
 > still targets Linux + NVIDIA.
@@ -63,9 +64,17 @@ $HF download Wan-AI/Wan2.1-T2V-1.3B --exclude 'diffusion_pytorch_model*' --local
 | peak memory               | ~18 GB                        |
 
 This is batch generation, not interactive latency: the rollout is compute-bound, about 100×
-below the B200 numbers above. Training, latency profiling, the LingBot demo, and FastFrames-L
-(14B, doesn't fit in 64 GB without offloading) are not ported. [MAC.md](MAC.md) lists every
-change and why, including the Metal flash-attention kernel used for attention on MPS.
+below the B200 numbers above.
+
+The [LingBot interactive demo](#interactive-demo-with-lingbot) also runs on a Mac (single device,
+eager): `.venv/bin/python apps/lingbot/demo.py --gpus 1 --lingbot-root upstream/lingbot-world-v2`.
+Once warm, each 1 s turn (16 frames) takes ~11-22 s on the M4 Max, so you explore shot by shot.
+Setup, measurements and the changes are in
+[MAC.md](MAC.md#lingbot-camera-control-interactive-demo).
+
+Training, latency profiling, multi-GPU LingBot, and FastFrames-L (14B, doesn't fit in 64 GB
+without offloading) are not ported. [MAC.md](MAC.md) lists every change and why, including the
+Metal flash-attention kernel used for attention on MPS.
 
 ## Latency Profiling
 

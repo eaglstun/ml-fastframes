@@ -7,7 +7,7 @@ import os
 
 import torch
 
-__all__ = ["default_device", "f64_device", "on_mps"]
+__all__ = ["default_device", "f64_device", "on_mps", "synchronize"]
 
 
 def default_device():
@@ -28,3 +28,12 @@ def on_mps(device):
 def f64_device(device):
     """Where float64 math for tensors on ``device`` can run."""
     return torch.device("cpu") if on_mps(device) else torch.device(device)
+
+
+def synchronize(device):
+    """``torch.cuda.synchronize`` / ``torch.mps.synchronize`` for ``device`` (no-op on CPU)."""
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()

@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 
 __all__ = ["HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH", "CHUNK", "DEFAULT_INTRINSICS",
-           "text_context", "image_condition", "latent_count", "Trajectory", "LiveCamera",
+           "text_context", "image_condition", "LazyImageCondition", "latent_count", "Trajectory", "LiveCamera",
            "KeyboardCamera", "ACTIONS"]
 
 HEIGHT, WIDTH = 464, 832
@@ -65,6 +65,56 @@ def image_condition(vae, image, latents, device):
     mask = torch.zeros(4, latents, LATENT_HEIGHT, LATENT_WIDTH, device=device, dtype=encoded.dtype)
     mask[:, 0] = 1
     return torch.cat([mask, encoded])
+
+
+class LazyImageCondition:
+    """``image_condition`` encoded chunk by chunk, on first use.
+
+    Upstream encodes the first image plus ``4 * (latents - 1)`` black frames for the whole horizon
+    up front. The Wan VAE encoder is causal: it consumes 1 frame, then 4 frames per latent, with a
+    rolling feature cache, and its output projection is per frame. So encoding latent ``l`` only
+    when chunk ``l // 4`` needs it, while keeping the cache alive, performs the same computation:
+    same results, without the multi-minute wait and peak memory of a long horizon.
+    ``chunk(c)`` must be called with ``c = 0, 1, 2, ...`` (each at most once beyond the cache).
+    """
+
+    def __init__(self, vae, image, latents, device):
+        from torchvision.transforms import functional as TF
+
+        if abs(image.width * HEIGHT / (image.height * WIDTH) - 1) > 0.05:
+            warnings.warn(f"the {image.width} x {image.height} image is stretched to {WIDTH} x {HEIGHT}")
+        pixels = TF.to_tensor(image.convert("RGB")).sub_(0.5).div_(0.5)
+        self.first = F.interpolate(pixels[None], size=(HEIGHT, WIDTH), mode="bicubic").transpose(0, 1)[None]
+        self.vae, self.latents, self.device = vae, latents, torch.device(device)
+        self.encoded = []  # latent frames [16, 1, 58, 104] in order
+        vae.model.clear_cache()
+
+    def _encode_next(self):
+        model, index = self.vae.model, len(self.encoded)
+        frames = self.first if index == 0 else torch.zeros(1, 3, 4, HEIGHT, WIDTH)
+        with torch.amp.autocast("cuda", dtype=self.vae.dtype, enabled=self.device.type == "cuda"):
+            model._enc_conv_idx = [0]
+            out = model.encoder(frames.to(self.device), feat_cache=model._enc_feat_map,
+                                feat_idx=model._enc_conv_idx)
+            mu = model.conv1(out).chunk(2, dim=1)[0]
+            scale = self.vae.scale
+            if isinstance(scale[0], torch.Tensor):
+                mu = (mu - scale[0].view(1, model.z_dim, 1, 1, 1)) * scale[1].view(1, model.z_dim, 1, 1, 1)
+            else:
+                mu = (mu - scale[0]) * scale[1]
+        self.encoded.append(mu.float().squeeze(0))
+
+    def chunk(self, c):
+        """``[20, 4, 58, 104]`` condition of latent frames ``[4c, 4c + 4)``."""
+        while len(self.encoded) < CHUNK * (c + 1):
+            self._encode_next()
+        if len(self.encoded) == self.latents:
+            self.vae.model.clear_cache()  # horizon fully encoded: drop the feature cache
+        encoded = torch.cat(self.encoded[CHUNK * c:CHUNK * (c + 1)], dim=1)
+        mask = torch.zeros(4, CHUNK, LATENT_HEIGHT, LATENT_WIDTH, device=encoded.device, dtype=encoded.dtype)
+        if c == 0:
+            mask[:, 0] = 1
+        return torch.cat([mask, encoded])
 
 
 def latent_count(frames):

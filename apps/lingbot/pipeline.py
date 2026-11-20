@@ -31,9 +31,10 @@ import torch
 from fastframes.checkpoints import load_state_dict
 from fastframes.models.kv_refinement import KVRefinementNetwork
 from fastframes.models.pixel_decoder import PixelDecoder
+from fastframes.device import default_device
 from fastframes.pipeline import to_uint8
 
-from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH, image_condition, text_context
+from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH, LazyImageCondition, text_context
 from .decoder import CapturedDecoder, SpatialDecoder
 from .dit import CACHE_FRAMES, FRAME_TOKENS, LingBotDiT, rope_frequencies, rope_table
 from .refiner import KVRefiner
@@ -108,7 +109,9 @@ class FastFramesLingBot:
         self.timesteps = tuple(int(t) for t in self.schedule)
         # sigma of every step, located like the upstream flow -> x0 conversion (float64)
         sigmas, grid = scheduler.sigmas.double(), scheduler.timesteps.double()
-        self.sigmas = [sigmas[torch.argmin((grid - t).abs())].to(self.device) for t in self.schedule]
+        # MPS has no float64: keep the sigmas (and the x0 update in ``step``) on the CPU there
+        self.f64 = torch.device("cpu") if self.device.type == "mps" else self.device
+        self.sigmas = [sigmas[torch.argmin((grid - t).abs())].to(self.f64) for t in self.schedule]
         head_dim = dit.dim // dit.num_heads
         self.freqs = rope_frequencies(head_dim, self.device)
         dit.freqs = self.freqs
@@ -121,7 +124,8 @@ class FastFramesLingBot:
         result = self.dit.result
         self.refiner = KVRefiner(refiner, dit.patch_embedding, self.cache_k, self.cache_v, result.key, result.value,
                                  self.timesteps[-1], world=world, rank=rank,
-                                 heads_per_stream=model.kv_layers_per_stream[world], compile=compile, graphs=graphs)
+                                 heads_per_stream=model.kv_layers_per_stream[world] if self.device.type == "cuda"
+                              else None, compile=compile, graphs=graphs)
         decoder_cls = CapturedDecoder if world == 1 else SpatialDecoder
         self.decoder = decoder_cls(decoder, compile=compile, graphs=graphs)
         self.prompt = self.condition = self.noise = self.generator = None
@@ -130,10 +134,11 @@ class FastFramesLingBot:
 
     @classmethod
     def from_pretrained(cls, name, *, lingbot_root, lingbot_checkpoint, checkpoint_dir, assets_dir=None, world=1,
-                        rank=0, compile=True, graphs=True, device="cuda"):
+                        rank=0, compile=True, graphs=True, device=None):
         """``lingbot_checkpoint``: official weights of the model (T5/VAE are also looked up in
         ``assets_dir``); ``checkpoint_dir``: ``kv_refiner.safetensors`` and ``pixel_decoder.safetensors``."""
         import_upstream(lingbot_root)
+        device = device or default_device()
         model = MODELS[name]
         upstream = load_upstream(model.config, lingbot_checkpoint, assets_dir,
                                  fp32_time_weights=model.fp32_time_weights, device=device)
@@ -151,7 +156,8 @@ class FastFramesLingBot:
     def start(self, image, prompt, *, seed=0, latents=240, noise="clip"):
         """Begin a video from a PIL ``image`` and ``prompt`` with a horizon of ``latents`` latent frames.
 
-        The image condition is encoded for the whole horizon, as upstream. ``noise="clip"``
+        The image condition is encoded chunk by chunk as it is needed (same values as upstream's
+        whole-horizon encoding, see ``LazyImageCondition``). ``noise="clip"``
         draws the initial noise of the whole horizon at the start (upstream), ``"chunk"`` draws
         it chunk by chunk; both then draw three transition noises per chunk.
         """
@@ -160,7 +166,7 @@ class FastFramesLingBot:
         if prompt != self.prompt:
             self.dit.set_context(text_context(self.upstream.text_encoder, prompt, self.device))
             self.prompt = prompt
-        self.condition = image_condition(self.upstream.vae, image, latents, self.device)
+        self.condition = LazyImageCondition(self.upstream.vae, image, latents, self.device)
         self.latents = latents
         self.restart(seed=seed, noise=noise)
 
@@ -208,7 +214,7 @@ class FastFramesLingBot:
             raise RuntimeError("no session or horizon reached; call start() or restart()")
         read_frames = min(CHUNK * (chunk + 1), CACHE_FRAMES)
         self._evict(chunk)
-        y = self.condition[:, CHUNK * chunk:CHUNK * (chunk + 1)]
+        y = self.condition.chunk(chunk)
         rope = rope_table(self.freqs, CHUNK * chunk)
         self.dit.begin_chunk(y, rays, rope)
         if self.noise is not None:
@@ -217,7 +223,8 @@ class FastFramesLingBot:
             x = torch.randn((16, CHUNK, LATENT_HEIGHT, LATENT_WIDTH), device=self.device, generator=self.generator)
         for i, timestep in enumerate(self.timesteps):
             result = self.dit(x, timestep, read_frames)
-            x0 = (x.double() - self.sigmas[i] * result.prediction.double()).float()
+            x0 = (x.to(self.f64).double() - self.sigmas[i] * result.prediction.to(self.f64).double()).float()
+            x0 = x0.to(self.device)
             if i + 1 < len(self.timesteps):
                 noise = torch.randn(x0.shape, device=self.device, dtype=x0.dtype, generator=self.generator)
                 x = self.scheduler.add_noise(x0, noise, self.schedule[i + 1])

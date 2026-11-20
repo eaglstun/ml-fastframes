@@ -2,7 +2,8 @@
 
 Notes for coding agents working on this fork of
 [apple-aiml-research/ml-fastframes](https://github.com/apple-aiml-research/ml-fastframes).
-The fork adds Apple Silicon (MPS) inference for FastFrames-S text-to-video. Read `MAC.md` for
+The fork adds Apple Silicon (MPS) inference for FastFrames-S text-to-video and the LingBot
+camera-control demo (`apps/lingbot/`). Read `MAC.md` for
 the full change list and measurements. Everything outside inference is upstream code that still
 targets Linux + NVIDIA.
 
@@ -17,6 +18,10 @@ targets Linux + NVIDIA.
 - `fastframes/device.py`: device selection and float64 placement (added by this fork).
 - `fastframes/training/`: training only, CUDA/NCCL/Triton. Not ported.
 - `scripts/generate.py`: T2V CLI. `MAC.md`: the Mac port write-up.
+- `apps/lingbot/`: LingBot-World v2 camera control. `generate.py` (video), `demo.py` +
+  `demo_worker.py` (browser demo, websocket at `/ws`), `pipeline.py` (chunked rollout),
+  `upstream.py` (imports the pinned clone in `upstream/lingbot-world-v2`; treat that clone as
+  read-only third-party code and patch around it here).
 
 ## Environment
 
@@ -68,6 +73,13 @@ There are no unit tests for the inference path. Verify a change by:
   while command buffers are still in flight.
 - **Unified memory is shared** between CPU and GPU. umT5 (11 GB) gets moved to CPU after
   prompts are encoded, and it's built on the meta device (random FP32 init cost 48 s and 22 GB).
+- **LingBot conditioning is encoded lazily** (`conditioning.LazyImageCondition`), one latent per
+  chunk. Encoding the whole horizon up front on MPS corrupts the final latent (0.4 max abs error
+  vs CPU) and costs minutes plus ~40 GB. Check any change here against a CPU encode.
+- **LingBot runs eager off CUDA.** torch.compile, CUDA graphs, CUDA streams, and the warm-up
+  passes that feed them are gated on `device.type == "cuda"`. Verify the demo with a scripted
+  websocket client (`start`, then `action` / `displayed` messages) and time a *second* session:
+  the first one includes Metal shader compiles.
 - Measured dead ends: `fast_ops` (fused QKV) is slower on MPS, and fp16 is slower than bf16 on
   M4. cuDNN SDPA is CUDA-only; on other devices `attention()` falls through to plain SDPA.
 

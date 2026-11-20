@@ -22,6 +22,8 @@ each rank refines its 754 query tokens for all layers; the results are all-gathe
 from __future__ import annotations
 
 import torch
+
+from fastframes.device import synchronize
 import torch.distributed as dist
 import torch.nn.functional as F
 
@@ -114,11 +116,12 @@ class KVRefiner:
         self.k, self.v = key.view(layers, TOKENS, dim), value.view(layers, TOKENS, dim)
         self.use_graphs, self.graphs = graphs, {}
         device = self.k.device
+        self.device_type = device.type
         self.x = torch.empty(16, CHUNK, LATENT_HEIGHT, LATENT_WIDTH, device=device)
         self.y = torch.empty(20, CHUNK, LATENT_HEIGHT, LATENT_WIDTH, device=device)
         self.rope = torch.empty(TOKENS, 1, net.head_dim // 2, 2, device=device)
         self.count = heads_per_stream
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast(self.device_type, enabled=False):
             self.stem_module = _Stem(net, patch, timestep, world, rank)
             embedding = net.embed_timestep(timestep, 1, device, torch.bfloat16)
             self.head_modules = [_Heads(net, embedding, lo, lo + self.count) for lo in range(0, layers, self.count)]
@@ -131,12 +134,13 @@ class KVRefiner:
         self.heads = [compiled(h) for h in self.head_modules]
         self.rotate = compiled(rope_real)
         self.commit = compiled(self._commit)
-        self.streams = [torch.cuda.Stream(device=device) for _ in self.heads] if len(self.heads) > 1 else []
+        self.streams = ([torch.cuda.Stream(device=device) for _ in self.heads]
+                        if len(self.heads) > 1 and device.type == "cuda" else [])
         self.local_tokens = TOKENS // world
         self.local = torch.empty(2, layers, self.local_tokens, dim, device=device, dtype=torch.bfloat16)
         self.gathered = (torch.empty(world, 2, layers, self.local_tokens, dim, device=device, dtype=torch.bfloat16)
                          if world > 1 else None)
-        self.pool = torch.cuda.graph_pool_handle()
+        self.pool = torch.cuda.graph_pool_handle() if graphs else None
 
     def _commit(self, key, value, read_frames: int):
         end = read_frames * FRAME_TOKENS
@@ -152,7 +156,7 @@ class KVRefiner:
         self.local[1, first:last].copy_(vr)
 
     def _body(self, read_frames):
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast(self.device_type, enabled=False):
             phi = self.stem(self.x, self.y)
             lo = self.rank * self.local_tokens
             hi = lo + self.local_tokens
@@ -165,7 +169,8 @@ class KVRefiner:
                 for stream in self.streams:
                     caller.wait_stream(stream)
             else:
-                self._refine(self.heads[0], 0, self.layers, phi, lo, hi)
+                for group, head in enumerate(self.heads):  # sequential head groups off CUDA
+                    self._refine(head, group * self.count, (group + 1) * self.count, phi, lo, hi)
             if self.world > 1:
                 dist.all_gather_into_tensor(self.gathered.view(-1, self.local_tokens, self.dim),
                                             self.local.view(-1, self.local_tokens, self.dim))
@@ -198,5 +203,5 @@ class KVRefiner:
         self.graphs[read_frames].replay()
 
     def close(self):
-        torch.cuda.synchronize(self.k.device)
+        synchronize(self.k.device)
         self.graphs.clear()

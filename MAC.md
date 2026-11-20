@@ -1,6 +1,7 @@
 # FastFrames on Apple Silicon (MPS)
 
-Tested on an M4 Max (64 GB), macOS, PyTorch 2.9.1, FastFrames-S T2V (`scripts/generate.py`).
+Tested on an M4 Max (64 GB), macOS, PyTorch 2.9.1: FastFrames-S T2V (`scripts/generate.py`) and the
+LingBot camera-control demo ([below](#lingbot-camera-control-interactive-demo)).
 Output is the same 832x480, 81-frame, 16 fps video as on CUDA.
 
 ## Setup
@@ -77,7 +78,66 @@ kernel, 78.0 / 69.8 / 74.8 s with SDPA. The video is not bit-identical to the SD
 autoregressive rollout amplifies rounding differences: frame PSNR 35 dB at frame 0, ~22-24 dB by
 frames 40 and 80), but it is the same scene at the same quality, and is deterministic run to run.
 
-## What was changed (see `git diff`)
+## LingBot camera control (interactive demo)
+
+The LingBot-World v2 1.3B app (`apps/lingbot/`: image + prompt in, a world you steer with
+WASD/arrow keys out) also runs on MPS, both the browser demo and `generate.py`. It runs eagerly:
+torch.compile and CUDA graphs are switched off automatically off CUDA. Setup on top of the
+FastFrames-S venv above (weights are CC BY-NC-SA 4.0, non-commercial):
+
+```bash
+uv pip install -p .venv/bin/python "diffusers==0.31.0" easydict imageio scipy tqdm \
+    "websockets>=15,<17" "Pillow>=12.3"
+mkdir -p upstream
+git clone https://github.com/robbyant/lingbot-world-v2 upstream/lingbot-world-v2
+git -C upstream/lingbot-world-v2 checkout 1895d300d8ac936401689b26389f51cbd36530eb
+$HF download apple/FastFrames-S --include 'lingbot-1.3b/*' --local-dir checkpoints
+$HF download robbyant/lingbot-world-v2-1.3b-causal-fast \
+    --local-dir checkpoints/lingbot-world-v2-1.3b-causal-fast/transformers
+$HF download robbyant/lingbot-world-v2-14b-causal-fast \
+    --include 'models_t5_umt5-xxl-enc-bf16.pth' --include 'Wan2.1_VAE.pth' --include 'google/umt5-xxl/*' \
+    --local-dir checkpoints/lingbot-world-v2-14b-causal-fast
+
+# browser demo at http://127.0.0.1:8000
+.venv/bin/python apps/lingbot/demo.py --gpus 1 --lingbot-root upstream/lingbot-world-v2
+# or a video (2 chunks = 29 frames; --frames 961 for the full 60 chunks)
+.venv/bin/python apps/lingbot/generate.py --model lingbot-1.3b --lingbot-root upstream/lingbot-world-v2 \
+    --example upstream/lingbot-world-v2/examples/00 --frames 29 --output outputs/lingbot.mp4
+```
+
+Measured on the M4 Max with the demo server driven by a scripted websocket client (scene 00,
+idle GPU). Each turn is one chunk: 16 frames, 1 s of 16 fps video at 832x464.
+
+| | first session after server start | warm session (same server) |
+|---|---|---|
+| world ready | 10.9 s | 0.1 s (scene reused) |
+| chunk 0 (13 frames) | 44.7 s | 10.8 s |
+| turn 1 | 37.1 s | 11.9 s |
+| turn 2 | 14.3 s | 14.8 s |
+| turn 3 | 20.0 s | 18.6 s |
+| turn 4 | 20.5 s | 21.7 s |
+
+The first session pays one-time Metal shader compiles and allocations for new shapes. Turns
+get slower while the rolling KV cache fills (it holds 18 latent frames, full after about five
+chunks), so a warm turn should level off around 22 s; that ceiling wasn't measured past turn 4.
+That's ~11-22x slower than real time: you explore shot by shot rather than play. Peak memory
+went from 83 GB (upstream conditioning) to 43 GB on a 2-chunk `generate.py` run.
+
+What changed for LingBot:
+
+| Problem on Mac | Fix |
+|---|---|
+| Upstream `wan/modules/t5.py` evaluates `torch.cuda.current_device()` as a default argument at import time | `upstream.py` stubs it to `"cpu"` only during that import, without CUDA; the clone isn't modified |
+| The image condition was VAE-encoded for the whole 60-chunk horizon before the first frame: minutes of work, ~40 GB extra, and on MPS the **last latent comes out wrong** (0.4 max abs error vs a CPU reference) | `conditioning.LazyImageCondition` runs the same causal encoder (same feature cache) one latent at a time, just before each chunk needs it; it matches the CPU reference to 7e-6 |
+| umT5 built with random FP32 init: 82 s to load | Meta-device build + `load_state_dict(assign=True)` from an mmapped checkpoint: 0.9 s, bit-identical embeddings |
+| complex128 RoPE table, float64 timestep sinusoids and x0 update | Computed on CPU, results moved to MPS (as for FastFrames-S) |
+| Attention uses split-KV SDPA tuned for CUDA | On MPS it calls `fastframes.wan.attention`, i.e. the Metal flash kernel |
+| `torch.autocast("cuda")`, CUDA streams for KV-refinement head groups and decoder warm-up, `torch.cuda.synchronize` | Autocast on the tensor's device type; head groups run sequentially and warm-ups are skipped off CUDA; `fastframes.device.synchronize` |
+| torch.compile (inductor max-autotune), CUDA graphs, demo warm-up passes that only exist to trigger them | Eager off CUDA (`generate.py` picks it automatically; the demo worker passes `compile=False, graphs=False`) |
+| `from_pretrained(device=None)` left the refiner/decoder on CPU | The device is resolved once at the top (`default_device()`) |
+| Demo memory stats call `torch.cuda` | MPS reports `current_allocated_memory` / `driver_allocated_memory` |
+
+## What was changed for FastFrames-S (see `git diff`)
 
 | Problem on Mac | Fix |
 |---|---|
@@ -91,5 +151,5 @@ frames 40 and 80), but it is the same scene at the same quality, and is determin
 | OpenH264 binary is linux64-only (ctypes) | Non-Linux `save_video` uses ffmpeg/libx264, BT.601 limited range, faststart |
 
 Not ported: training (NCCL, Triton flex_attention, CUDA RNG state), the latency benchmark, and
-FastFrames-L (14B: ~28 GB DiT + ~26 GB KV cache + T5 does not fit in 64 GB without offloading).
-The LingBot demo was not tried.
+FastFrames-L (14B: ~28 GB DiT + ~26 GB KV cache + T5 does not fit in 64 GB without offloading),
+multi-device LingBot (`--gpus 8`, torchrun), and the LingBot latency benchmarks.

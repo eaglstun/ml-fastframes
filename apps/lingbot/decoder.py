@@ -19,6 +19,8 @@ from __future__ import annotations
 import math
 
 import torch
+
+from fastframes.device import synchronize
 import torch.distributed as dist
 import torch.nn.functional as F
 
@@ -88,6 +90,10 @@ class CapturedDecoder:
                      if compile else runtime.forward)
         self.graph = None
         with torch.inference_mode():
+            if device.type != "cuda":
+                if graphs:
+                    raise ValueError("CUDA graphs need a CUDA device; pass graphs=False")
+                return
             stream = torch.cuda.Stream(device=device)
             stream.wait_stream(torch.cuda.current_stream(device))
             with torch.cuda.stream(stream):
@@ -116,7 +122,7 @@ class CapturedDecoder:
         return self.output
 
     def close(self):
-        torch.cuda.synchronize(self.features.device)
+        synchronize(self.features.device)
         self.graph = None
 
 

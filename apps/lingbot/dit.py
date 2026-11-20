@@ -35,6 +35,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from fastframes.device import synchronize
+from fastframes.wan.attention import attention as _ff_attention
+
 from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
 
 __all__ = ["LingBotDiT", "DiTResult", "rope_real", "rope_table", "rope_frequencies", "all_gather_into"]
@@ -62,8 +65,10 @@ def rope_frequencies(head_dim, device):
     from wan.modules.model_fast import rope_params
 
     d = head_dim
+    # complex128: kept on the CPU for MPS (no complex128 there); ``rope_table`` output is FP32
+    device = torch.device(device)
     return torch.cat([rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)),
-                      rope_params(1024, 2 * (d // 6))], dim=1).to(device)
+                      rope_params(1024, 2 * (d // 6))], dim=1).to("cpu" if device.type == "mps" else device)
 
 
 def rope_table(freqs, start_frame):
@@ -99,6 +104,9 @@ def layer_norm(value, module):
 
 def attention(query, key, value, split=1):
     """``query [1, Q, H, D]`` over ``key, value [1, K, H, D]`` with cuDNN; exact split-KV merge."""
+    if query.device.type == "mps":
+        # Metal flash attention (or per-head SDPA) on the [B, L, H, D] layout; split-KV is a CUDA tuning
+        return _ff_attention(query, key, value).to(query.dtype)
     q = query.transpose(1, 2)
     if split == 1:
         with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
@@ -218,7 +226,7 @@ class LingBotDiT:
     def set_context(self, context):
         """Text K/V of every block for a ``[512, 4096]`` prompt embedding (written in place)."""
         m = self.model
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(self.device.type, dtype=torch.bfloat16):
             projected = m.text_embedding(context.reshape(1, 512, 4096))
             for i, block in enumerate(m.blocks):
                 cross = block.cross_attn
@@ -228,12 +236,13 @@ class LingBotDiT:
     @torch.no_grad()
     def _time_bank(self):
         m, bank = self.model, {}
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast(self.device.type, enabled=False):
             half = m.freq_dim // 2
-            inv = 10000 ** (-torch.arange(half, device=self.device, dtype=torch.float64) / half)
+            f64 = "cpu" if self.device.type == "mps" else self.device  # MPS has no float64
+            inv = 10000 ** (-torch.arange(half, device=f64, dtype=torch.float64) / half)
             for timestep in self.timesteps:
                 phases = timestep * inv
-                sinusoid = torch.cat([phases.cos(), phases.sin()])[None, None].float()
+                sinusoid = torch.cat([phases.cos(), phases.sin()])[None, None].float().to(self.device)
                 e = m.time_embedding(sinusoid)
                 bank[timestep] = e, m.time_projection(e).unflatten(-1, (6, self.dim))
         return bank
@@ -305,7 +314,7 @@ class LingBotDiT:
         head = self.model.head
         e = (head.modulation.unsqueeze(0) + self.time_e.unsqueeze(2)).unbind(2)
         hidden = layer_norm(value, head.norm) * (1 + e[1]) + e[0]
-        with torch.autocast("cuda", enabled=False):  # the upstream head runs in FP32
+        with torch.autocast(self.device.type, enabled=False):  # the upstream head runs in FP32
             output = F.linear(hidden.float(), head.head.weight.float(), head.head.bias.float())
         # Upstream unpatchifies under BF16 autocast, which rounds the prediction to BF16.
         output = output.to(torch.bfloat16).reshape(self.local_tokens, 64)
@@ -332,7 +341,7 @@ class LingBotDiT:
         self.y.copy_(y)
         self.camera.copy_(camera)
         self.rope.copy_(rope)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(self.device.type, dtype=torch.bfloat16):
             if not self.use_graphs:
                 self._camera_run()
             else:
@@ -368,7 +377,7 @@ class LingBotDiT:
         self.x.copy_(x)
         self.time_e.copy_(self.time_bank[timestep][0])
         self.time_e0.copy_(self.time_bank[timestep][1])
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(self.device.type, dtype=torch.bfloat16):
             if not self.use_graphs:
                 self._run(*key)
             else:
@@ -381,7 +390,7 @@ class LingBotDiT:
 
     def close(self):
         """Release graphs before their symmetric-memory buffers (call on every rank)."""
-        torch.cuda.synchronize(self.device)
+        synchronize(self.device)
         self.graphs.clear()
         self._camera_graph = None
         self.gather = [None] * self.layers
