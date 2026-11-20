@@ -30,10 +30,13 @@ def use_conv2d(conv, x):
 
 def _taps(conv):
     weight = conv.weight
+    # Rebuild when the weight is replaced or modified in place. Inference tensors (a model loaded
+    # under torch.inference_mode) have no version counter and can't be modified in place anyway.
+    version = None if weight.is_inference() else weight._version
     cached = getattr(conv, "_mps_conv2d_taps", None)
-    if cached is None or cached[0] is not weight or cached[1] != weight._version:
+    if cached is None or cached[0] is not weight or cached[1] != version:
         taps = [weight[:, :, k].contiguous() for k in range(weight.shape[2])]
-        conv._mps_conv2d_taps = cached = (weight, weight._version, taps)
+        conv._mps_conv2d_taps = cached = (weight, version, taps)
     return cached[2]
 
 
