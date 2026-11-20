@@ -160,7 +160,8 @@ def _block(D, H, RT, NK, tail):
     for dc in DC:
         pv = dc % NV
         steps.append(([f"BFRAG(V{j}_{pv}) = {vload(j, dc)};" for j in J],
-                      [f"simdgroup_multiply_accumulate(O{i}_{dc}, S{i}_{j}, V{j}_{pv}, O{i}_{dc});" for i in R for j in J]))
+                      [f"simdgroup_multiply_accumulate(O{i}_{dc}, S{i}_{j}, V{j}_{pv}, O{i}_{dc});"
+                       for i in R for j in J]))
     _emit(w, steps, LA)
     return "".join(f"        {x}\n" for x in o)
 
@@ -177,7 +178,8 @@ def _body(D, H, RT, NK):
     w(f"    const device bfloat* qt = qh + ulong(r0) * {ST} + fc;")
     for i in range(RT):
         w(f"    float m{i} = NEG, l{i} = 0.0f;")
-        w("    mat " + ", ".join(f"O{i}_{dc} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f)" for dc in range(DT)) + ";")
+        w("    mat " + ", ".join(f"O{i}_{dc} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"
+                              for dc in range(DT)) + ";")
     w("    uint kb = 0;")
     w(f"    for (; kb + {8 * NK} <= Lk; kb += {8 * NK}) {{")
     w(_block(D, H, RT, NK, False) + "    }")
