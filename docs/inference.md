@@ -3,6 +3,9 @@
 Run commands from the repository root after [installation and checkpoint setup](installation.md).
 Measurements below use NVIDIA B200 GPUs with PyTorch 2.9.1 / CUDA 12.8.
 For camera-controlled generation and Fig. 5, see the [LingBot guide](lingbot.md).
+On an Apple Silicon Mac, generation and the single-device profiles run through MPS: see
+[MAC.md](../MAC.md#latency-benchmarks) for commands and M4 Max numbers. The multi-GPU,
+720p/14B and baseline rows are CUDA-only.
 
 ## Profiling
 

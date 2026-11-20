@@ -7,7 +7,7 @@
 
 > **This fork adds Apple Silicon (MPS) support for FastFrames-S text-to-video and the LingBot
 > camera-control demo.** On an M4 Max, T2V takes ~45-50 s per 81-frame 480p video with ~18 GB peak
-> memory, and the LingBot demo makes each 1 s turn in ~11-22 s. See
+> memory, and the LingBot demo makes each 1 s turn in ~12-24 s. See
 > [Apple Silicon](#apple-silicon-mps) and [MAC.md](MAC.md). Everything else is upstream
 > [apple-aiml-research/ml-fastframes](https://github.com/apple-aiml-research/ml-fastframes) and
 > still targets Linux + NVIDIA.
@@ -68,7 +68,7 @@ below the B200 numbers above.
 
 The [LingBot interactive demo](#interactive-demo-with-lingbot) also runs on a Mac (single device,
 eager): `.venv/bin/python apps/lingbot/demo.py --gpus 1 --lingbot-root upstream/lingbot-world-v2`.
-Once warm, each 1 s turn (16 frames) takes ~11-22 s on the M4 Max, so you explore shot by shot.
+Once warm, each 1 s turn (16 frames) takes ~12-24 s on the M4 Max, so you explore shot by shot.
 Setup, measurements and the changes are in
 [MAC.md](MAC.md#lingbot-camera-control-interactive-demo).
 

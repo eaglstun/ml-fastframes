@@ -110,18 +110,19 @@ idle GPU). Each turn is one chunk: 16 frames, 1 s of 16 fps video at 832x464.
 
 | | first session after server start | warm session (same server) |
 |---|---|---|
-| world ready | 10.9 s | 0.1 s (scene reused) |
-| chunk 0 (13 frames) | 44.7 s | 10.8 s |
-| turn 1 | 37.1 s | 11.9 s |
-| turn 2 | 14.3 s | 14.8 s |
-| turn 3 | 20.0 s | 18.6 s |
-| turn 4 | 20.5 s | 21.7 s |
+| world ready | 16.0 s | 0.0 s (scene reused) |
+| chunk 0 (13 frames) | 19.6 s | 12.5 s |
+| turn 1 | 24.2 s | 14.2 s |
+| turn 2 | 26.3 s | 18.1 s |
+| turn 3 | 29.3 s | 22.0 s |
+| turns 4-8 | 31.2-34.3 s | 23.5-24.0 s |
 
 The first session pays one-time Metal shader compiles and allocations for new shapes. Turns
 get slower while the rolling KV cache fills (it holds 18 latent frames, full after about five
-chunks), so a warm turn should level off around 22 s; that ceiling wasn't measured past turn 4.
-That's ~11-22x slower than real time: you explore shot by shot rather than play. Peak memory
-went from 83 GB (upstream conditioning) to 43 GB on a 2-chunk `generate.py` run.
+chunks) and then hold at ~24 s, in line with `latency.py`'s 25.9 s per full-cache chunk. That's
+~12-24x slower than real time: you explore shot by shot rather than play. Peak memory went from
+83 GB (upstream conditioning) to 43 GB on a 2-chunk `generate.py` run; since the pipeline releases
+cached blocks after each chunk, `latency.py` holds a flat ~23 GB of driver memory.
 
 What changed for LingBot:
 
@@ -193,7 +194,7 @@ per LingBot chunk: background GPU work inflates these by up to ~30%.
   11 GB umT5 moved back to the CPU but its GPU blocks stayed reserved, and per-chunk temporaries
   piled up (34 GB after chunk 0, past 45 GB in chunk 1). On MPS the pipeline now calls
   `synchronize()` + `empty_cache()` after the prompt is encoded and after each chunk: 23 GB, flat.
-  This also applies to the demo; its turn timings above were measured before this change.
+  This also applies to the demo (its turn timings above include it).
 - **Numerical checks.** The pixel-decoder profile's streaming output is bit-identical to the
   clip-level decoder. The refinement profile's fast path differs from the release refinement by
   1.6% / 1.9% relative L2 (K / V); a CPU run gives 1.5% / 1.8%, so that's the BF16 fast path
