@@ -45,13 +45,24 @@ switches back to PyTorch SDPA (one head per call); `flash` is the default.
 
 - FlashAttention-style: each SIMD-group owns 16 query rows and walks the keys 24 at a time with an
   online softmax, so the `[Lq, Lk]` score matrix is never materialised. `Q K^T` and `P V` use the
-  GPU's 8x8 `simdgroup_matrix` multiply-accumulate in FP32 (BF16 in, BF16 out).
+  GPU's 8x8 `simdgroup_matrix` multiply-accumulate with BF16 operand tiles and FP32 accumulators
+  (BF16 in, BF16 out; the mixed form is bit-identical to widening the operands first).
+- Operand tiles are loaded three steps before the multiply that uses them (software pipelining,
+  `_LOOKAHEAD`). A load placed right before its use stalls the SIMD-group for the load latency:
+  hoisting the loads took the kernel from 10.6 to 12.5 TFLOPS with bit-identical output. The softmax
+  is base 2 (`log2(e)` folded into the scale, `exp2`), worth another ~2%.
 - Shapes are runtime arguments: one pipeline serves every KV length (and the L=512 text
   cross-attention), so nothing is cached per shape. It reads and writes the model's `[B, L, H, D]`
   layout directly, so there are no transpose copies.
 - The kernel source is generated as straight-line code (every 8x8 tile a named variable, every
   offset a literal). The same algorithm written with arrays of matrices in loops was 2-4x slower.
   16 query rows per SIMD-group is the limit: 24 or 32 fall out of registers and run ~1.6x slower.
+  8 rows multiply faster but double the SIMD-groups streaming K/V and end up memory-bound (7 TFLOPS).
+- Tried without success: staging K/V tiles in threadgroup memory for 8 SIMD-groups (the copy and
+  the two barriers per step cost what the sharing saves), `simdgroup_load` (1.4x slower than typed
+  per-thread loads), Q held in registers, permuting dims so one 8-byte load feeds two tiles,
+  rescaling the running output only when a row maximum changes, larger key blocks. Putting heads
+  on the fast dispatch axis is +2% at 1,560 query rows but -10% at 6,032, so it stays as is.
 - It relies on the lane-to-element layout of `simdgroup_matrix` (the trick MLX's steel kernels
   use), which the MSL spec doesn't guarantee. The layout is probed at first use and `attention()`
   falls back to SDPA if it doesn't hold. Credits are in the file header.
@@ -63,11 +74,12 @@ synchronized, median):
 |---|---|---|
 | 512 (cross-attention) | 1.1 ms | 1.8 ms |
 | 1,560 | 1.5 ms | 3.0 ms |
-| 15,600 | 14.0 ms | 28.5 ms |
-| 32,760 | 29.8 ms | 64.2 ms |
-| sum over the 21 KV lengths | **326 ms** | 673 ms |
+| 15,600 | 11.8 ms | 28.5 ms |
+| 32,760 | 24.9 ms | 64.2 ms |
+| sum over the 21 KV lengths | **275 ms** | 673 ms |
 
-That is ~10.6 TFLOPS for the whole attention, against ~5 for SDPA and 13-14.7 for a bare MPS GEMM.
+That is ~12.6 TFLOPS for the whole attention (13.0 at LingBot's 6,032 x 27,144), against ~5 for SDPA
+and 13-14.7 for a bare MPS GEMM; a loop of nothing but register-to-register 8x8 multiplies reaches ~14.
 Driver memory stays flat across all 22 shapes (1.03 GB in the benchmark, which is the test tensors).
 Against an FP32 CPU reference the kernel is closer than MPS SDPA, because it accumulates in FP32:
 on tensors captured from the rollout at 32,760 keys, max/mean abs error 7.8e-3 / 6.7e-4 (output
