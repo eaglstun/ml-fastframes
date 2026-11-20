@@ -22,10 +22,10 @@ each rank refines its 754 query tokens for all layers; the results are all-gathe
 from __future__ import annotations
 
 import torch
-
-from fastframes.device import synchronize
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from fastframes.device import synchronize
 
 from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
 from .dit import FRAME_TOKENS, READ_FRAMES, TOKENS, rope_real

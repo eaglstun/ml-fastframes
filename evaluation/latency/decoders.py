@@ -31,7 +31,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from dit import Geometry
 from models import load_decoder
-from timing import capture_graph, compare
+from timing import capture_graph, compare, synchronize
 
 from fastframes.checkpoints import load_state_dict
 from fastframes.models.pixel_decoder import BridgedPixelDecoder, align_frames
@@ -39,8 +39,8 @@ from fastframes.models.pixel_decoder import BridgedPixelDecoder, align_frames
 __all__ = ["StreamingPixelDecoder", "profile_decoder", "profile_vae"]
 
 
-def _autocast():
-    return torch.autocast("cuda", dtype=torch.bfloat16)
+def _autocast(device_type="cuda"):
+    return torch.autocast(device_type, dtype=torch.bfloat16)
 
 
 class StreamingPixelDecoder(torch.nn.Module):
@@ -122,7 +122,10 @@ class DecoderStep:
         else:
             self.runtime = StreamingPixelDecoder(decoder, (h, w))
         self.graph = None
+        self.device_type = device.type
         if cuda_graph:
+            if device.type != "cuda":
+                raise ValueError("CUDA graphs need a CUDA device")
             with _autocast():
                 self.graph, self.output = capture_graph(self._step, before_capture=self._reset)
             self._reset()
@@ -157,7 +160,7 @@ class DecoderStep:
         if self.graph is not None:
             self.graph.replay()
             return self.output
-        with _autocast():
+        with _autocast(self.device_type):
             return self._step()
 
 
@@ -171,7 +174,8 @@ def profile_decoder(args, ctx, record):
     frames = geometry.frames
     feats = torch.randn(1, frames * geometry.tokens, in_dim, generator=g, device=ctx.device, dtype=torch.bfloat16)
     mods = 0.2 * torch.randn(1, frames, 1, in_dim, generator=g, device=ctx.device, dtype=torch.bfloat16)
-    step = DecoderStep(decoder, geometry, in_dim, rank=ctx.rank, world=ctx.world, cuda_graph=not args.no_cuda_graph)
+    step = DecoderStep(decoder, geometry, in_dim, rank=ctx.rank, world=ctx.world,
+                       cuda_graph=not args.no_cuda_graph and ctx.device.type == "cuda")
 
     # Streaming (graph) output over a clip vs the release clip-level decoder (FastFrames.decode).
     shard = geometry.tokens // ctx.world
@@ -180,12 +184,12 @@ def profile_decoder(args, ctx, record):
     for f in range(frames):
         x = feats[:, f * geometry.tokens:(f + 1) * geometry.tokens][:, ctx.rank * shard:(ctx.rank + 1) * shard]
         frames_out.append(step(x, mods[:, f:f + 1]).clone())
-    torch.cuda.synchronize()
+    synchronize(ctx.device)
     check = None
     if ctx.is_main:
         stream = torch.cat(frames_out, dim=1)
         grid = torch.tensor([[frames, *geometry.grid]], device=ctx.device)
-        with torch.no_grad(), _autocast():
+        with torch.no_grad(), _autocast(ctx.device.type):
             dense = decoder(feats, mods, grid)
         check = {"streaming_vs_clip_decoder_last81": compare(align_frames(stream.float(), 4 * frames - 3),
                                                              align_frames(dense.float(), 4 * frames - 3))}
@@ -218,9 +222,12 @@ def profile_vae(args, ctx):
         latents = torch.randn(1, geometry.frames, 16, geometry.height, geometry.width, generator=g,
                               device=ctx.device, dtype=torch.bfloat16)
 
-    @torch.compile
+    cuda = ctx.device.type == "cuda"
+
     def fn(z):
         return vae.decode_to_pixel(z, use_cache=True)
+    if cuda:  # eager elsewhere
+        fn = torch.compile(fn)
 
     chunk = args.chunk
     starts = list(range(0, latents.shape[1] - chunk + 1, chunk))
@@ -229,17 +236,28 @@ def profile_vae(args, ctx):
         vae.model.clear_cache()
         events = []
         for f in starts:
+            if not cuda:  # synchronized wall time per call
+                synchronize(ctx.device)
+                t0 = time.perf_counter()
+                out = fn(latents[:, f:f + chunk])
+                synchronize(ctx.device)
+                events.append(((time.perf_counter() - t0) * 1000.0, out.shape[1]))
+                continue
             a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             a.record()
             out = fn(latents[:, f:f + chunk])
             b.record()
             events.append((a, b, out.shape[1]))
-        torch.cuda.synchronize()
+        synchronize(ctx.device)
+        if not cuda:
+            return events if record_events else None
         return [(a.elapsed_time(b), n) for a, b, n in events] if record_events else None
 
     started = time.perf_counter()
     with torch.no_grad():
-        dense = vae.decode_to_pixel(latents)  # compile/cudnn warm dense decode (not timed)
+        # compile/cudnn warm dense decode (not timed); skipped off CUDA, where decoding the whole
+        # clip at once takes tens of GB and is not needed (the streaming warm-up below suffices)
+        dense = vae.decode_to_pixel(latents) if cuda else None
         for _ in range(2):
             stream(False)
         prepare = time.perf_counter() - started
@@ -250,12 +268,14 @@ def profile_vae(args, ctx):
     first = [run[0][0] for run in runs]
     second = [run[1][0] for run in runs]
     return {"latency_ms": statistics.median(steady),
-            "settings": dict(compile="torch.compile", dtype="bfloat16",
+            "settings": dict(compile="torch.compile" if cuda else "eager", dtype="bfloat16",
                              latents_per_call=chunk, decoder_parameters=decoder_params,
                              weights=args.vae or "random", latents=args.latents or "random N(0, 1)",
-                             frames_per_call=runs[0][steady_calls[0]][1], dense_frames=int(dense.shape[1])),
+                             frames_per_call=runs[0][steady_calls[0]][1],
+                             dense_frames=None if dense is None else int(dense.shape[1])),
             "prepare_seconds": prepare,
-            "timing": {"statistic": f"median CUDA-event time of {chunk}-latent calls starting at latent "
+            "timing": {"statistic": f"median {'CUDA-event' if cuda else 'synchronized wall'} time of "
+                                    f"{chunk}-latent calls starting at latent "
                                     f"position >= 2, over {args.streams_measured} streams (2 untimed warm-up streams)",
                        "steady": {"count": len(steady), "median_ms": statistics.median(steady),
                                   "mean_ms": statistics.mean(steady), "min_ms": min(steady), "max_ms": max(steady)},

@@ -31,7 +31,7 @@ import torch
 import torch.nn.functional as F
 from dit import FrameDiT, Geometry
 from models import MODEL_DEFAULTS, load_dit, tuned_split_kv
-from timing import Dist, compare, environment, write_json
+from timing import Dist, compare, environment, synchronize, write_json
 
 from fastframes.wan.causal_model import FastOps
 
@@ -120,13 +120,13 @@ def main():
     dit.prepare(barrier=ctx.barrier)
     restore()
     dit()
-    torch.cuda.synchronize()
+    synchronize(ctx.device)
     outputs[f"optimized_graph_split{split}_world{ctx.world}"] = (dit.output.clone(), _gather_features(dit, ctx),
                                                                  *live_kv())
     # Changed input must change the captured output (the graph reads the static buffers).
     dit.latent.copy_(randn(*x_live.shape))
     dit()
-    torch.cuda.synchronize()
+    synchronize(ctx.device)
     changed = compare(dit.output, outputs[f"optimized_graph_split{split}_world{ctx.world}"][0])
     del dit
 

@@ -29,9 +29,9 @@ from pathlib import Path
 import torch
 
 from fastframes.checkpoints import load_state_dict
+from fastframes.device import default_device
 from fastframes.models.kv_refinement import KVRefinementNetwork
 from fastframes.models.pixel_decoder import PixelDecoder
-from fastframes.device import default_device
 from fastframes.pipeline import to_uint8
 
 from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH, LazyImageCondition, text_context

@@ -37,6 +37,7 @@ from PIL import Image  # noqa: E402
 from apps.lingbot.conditioning import Trajectory  # noqa: E402
 from apps.lingbot.generate import add_model_arguments, init_distributed, load_pipeline  # noqa: E402
 from apps.lingbot.upstream import import_upstream  # noqa: E402
+from fastframes.device import device_name, synchronize  # noqa: E402
 
 FIRST_TIMED_CHUNK = 8
 
@@ -79,21 +80,24 @@ def main():
     pipe.start(Image.open(example / "image.jpg").convert("RGB"), (example / "prompt.txt").read_text().strip(),
                seed=args.seed, latents=trajectory.latents)
 
+    device = pipe.device
+    cuda = device.type == "cuda"
     passes = 0
     while True:  # warm up: compile, autotune and capture every cache geometry
         before = compiler_counters()
         run_video(pipe, trajectory, args.seed)
-        torch.cuda.synchronize()
+        synchronize(device)
         passes += 1
-        stable = torch.tensor(int(compiler_counters() == before), device="cuda")
+        stable = torch.tensor(int(compiler_counters() == before), device=device)
         if world > 1:
             dist.all_reduce(stable, op=dist.ReduceOp.MIN)
-        if passes >= 2 and stable.item():
+        # Eager off CUDA: nothing is compiled, and one pass warms every cache geometry (Metal shaders)
+        if (passes >= 2 or not cuda) and stable.item():
             break
         if passes == 3:
             raise RuntimeError("compilation did not settle within three warm-up passes")
 
-    host = torch.empty((16, 464, 832, 3), dtype=torch.uint8, pin_memory=True) if rank == 0 else None
+    host = torch.empty((16, 464, 832, 3), dtype=torch.uint8, pin_memory=cuda) if rank == 0 else None
     samples, timed, clip = [], 0.0, 0
     before = compiler_counters()
 
@@ -101,18 +105,18 @@ def main():
         nonlocal timed
         if world > 1:
             dist.barrier()
-        torch.cuda.synchronize()
+        synchronize(device)
         begin = time.perf_counter()
         frames = pipe.step(trajectory.rays(chunk))
-        torch.cuda.synchronize()
+        synchronize(device)
         gpu_ms = (time.perf_counter() - begin) * 1000
         if chunk < FIRST_TIMED_CHUNK:
             return True
         if rank == 0:
-            host.copy_(frames, non_blocking=True)
-            torch.cuda.synchronize()
+            host.copy_(frames, non_blocking=cuda)
+            synchronize(device)
         cpu_ms = (time.perf_counter() - begin) * 1000
-        slowest = torch.tensor(gpu_ms, device="cuda", dtype=torch.float64)
+        slowest = torch.tensor(gpu_ms, device="cuda" if cuda else "cpu", dtype=torch.float64)
         if world > 1:
             dist.all_reduce(slowest, op=dist.ReduceOp.MAX)
         samples.append(dict(clip=clip, chunk=chunk, ms=slowest.item(), rank_ms=gpu_ms, cpu_ready_ms=cpu_ms))
@@ -121,7 +125,7 @@ def main():
 
     while run_video(pipe, trajectory, args.seed + clip, timed_chunk):
         clip += 1
-    recompiled = torch.tensor(int(compiler_counters() != before), device="cuda")
+    recompiled = torch.tensor(int(compiler_counters() != before), device=device)
     if world > 1:
         dist.all_reduce(recompiled, op=dist.ReduceOp.MAX)
     if recompiled.item():
@@ -135,7 +139,7 @@ def main():
             max_ms=max(values), samples=len(values), timed_seconds=timed, warmup_passes=passes,
             cpu_ready_ms=statistics.median(s["cpu_ready_ms"] for s in samples),
             statistic="median over chunks >= 8 of the slowest rank's synchronized chunk wall time",
-            gpu=torch.cuda.get_device_name(), torch=torch.__version__, chunk_samples=samples)
+            gpu=device_name(device), torch=torch.__version__, chunk_samples=samples)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(record, indent=2) + "\n")
         print(json.dumps({k: v for k, v in record.items() if k != "chunk_samples"}), flush=True)

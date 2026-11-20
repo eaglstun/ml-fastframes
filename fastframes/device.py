@@ -7,7 +7,7 @@ import os
 
 import torch
 
-__all__ = ["default_device", "f64_device", "on_mps", "synchronize"]
+__all__ = ["default_device", "device_name", "f64_device", "on_mps", "synchronize"]
 
 
 def default_device():
@@ -37,3 +37,18 @@ def synchronize(device):
         torch.cuda.synchronize(device)
     elif device.type == "mps":
         torch.mps.synchronize()
+
+
+def device_name(device):
+    """``torch.cuda.get_device_name`` / the Apple chip (e.g. ``Apple M4 Max``) / ``cpu``."""
+    device = torch.device(device)
+    if device.type == "cuda":
+        return torch.cuda.get_device_name(device)
+    if device.type == "mps":
+        import subprocess
+        try:
+            return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True,
+                                  text=True, timeout=5).stdout.strip() or "mps"
+        except Exception:  # diagnostic only
+            return "mps"
+    return "cpu"
