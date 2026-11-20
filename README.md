@@ -72,7 +72,10 @@ Once warm, each 1 s turn (16 frames) takes ~11-22 s on the M4 Max, so you explor
 Setup, measurements and the changes are in
 [MAC.md](MAC.md#lingbot-camera-control-interactive-demo).
 
-Training, latency profiling, multi-GPU LingBot, and FastFrames-L (14B, doesn't fit in 64 GB
+The single-device [latency benchmarks](MAC.md#latency-benchmarks) run too: one FastFrames-S step
+(4 frames) takes ~4.0 s on the M4 Max (35.4 ms on a B200), and one LingBot chunk ~27 s.
+
+Training, multi-GPU runs, the baseline latency rows, and FastFrames-L (14B, doesn't fit in 64 GB
 without offloading) are not ported. [MAC.md](MAC.md) lists every change and why, including the
 Metal flash-attention kernel used for attention on MPS.
 

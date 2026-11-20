@@ -29,7 +29,7 @@ from pathlib import Path
 import torch
 
 from fastframes.checkpoints import load_state_dict
-from fastframes.device import default_device
+from fastframes.device import default_device, release_mps_cache
 from fastframes.models.kv_refinement import KVRefinementNetwork
 from fastframes.models.pixel_decoder import PixelDecoder
 from fastframes.pipeline import to_uint8
@@ -166,6 +166,7 @@ class FastFramesLingBot:
         if prompt != self.prompt:
             self.dit.set_context(text_context(self.upstream.text_encoder, prompt, self.device))
             self.prompt = prompt
+            release_mps_cache(self.device)  # umT5 (11 GB) went back to the CPU; return its GPU blocks
         self.condition = LazyImageCondition(self.upstream.vae, image, latents, self.device)
         self.latents = latents
         self.restart(seed=seed, noise=noise)
@@ -234,6 +235,7 @@ class FastFramesLingBot:
             self.refiner(x0, y, rope, read_frames)
         pixels = self.decoder(result.features, result.embedding)
         self.chunk += 1
+        release_mps_cache(self.device)  # MPS: don't let the allocator hoard per-chunk temporaries
         if self.rank != 0:
             return None
         return to_uint8(pixels[0, 3:] if chunk == 0 else pixels[0])

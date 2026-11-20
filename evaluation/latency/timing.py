@@ -33,7 +33,7 @@ import torch.distributed as dist
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-from fastframes.device import default_device, device_name, synchronize  # noqa: E402
+from fastframes.device import default_device, device_name, limit_mps_memory, synchronize  # noqa: E402
 
 
 # --------------------------------------------------------------------------- distributed
@@ -51,11 +51,7 @@ class Dist:
             if self.world > 1:
                 raise RuntimeError("multi-device profiling needs CUDA")
             self.device = default_device()
-            if self.device.type == "mps" and "PYTORCH_MPS_HIGH_WATERMARK_RATIO" not in os.environ:
-                # By default MPS may allocate up to 1.7x the recommended working set and swap; a run
-                # that outgrows memory then stalls the whole machine (a watchdog panic). Cap it at
-                # the recommended working set (~75% of RAM) so it fails with an out-of-memory error.
-                torch.mps.set_per_process_memory_fraction(1.0)
+            limit_mps_memory()  # fail with out-of-memory instead of swapping the machine into a stall
         self.group_name = None
         if self.world > 1:
             dist.init_process_group("nccl", device_id=self.device)

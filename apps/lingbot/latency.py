@@ -37,7 +37,7 @@ from PIL import Image  # noqa: E402
 from apps.lingbot.conditioning import Trajectory  # noqa: E402
 from apps.lingbot.generate import add_model_arguments, init_distributed, load_pipeline  # noqa: E402
 from apps.lingbot.upstream import import_upstream  # noqa: E402
-from fastframes.device import device_name, synchronize  # noqa: E402
+from fastframes.device import default_device, device_name, limit_mps_memory, synchronize  # noqa: E402
 
 FIRST_TIMED_CHUNK = 8
 
@@ -71,9 +71,13 @@ def main():
     torch.set_num_threads(4)
 
     world, rank = init_distributed()
+    # fail with out-of-memory instead of swapping the machine into a stall; the first chunk's VAE
+    # encode needs more than the 0.6 default (31 GB on a 64 GB M4 Max)
+    limit_mps_memory(default=0.75)
     wan = import_upstream(args.lingbot_root)
     example = args.example or Path(wan.__file__).resolve().parents[1] / "examples" / "00"
-    trajectory = Trajectory(np.load(example / "poses.npy"), np.load(example / "intrinsics.npy"), args.frames)
+    trajectory = Trajectory(np.load(example / "poses.npy"), np.load(example / "intrinsics.npy"), args.frames,
+                            device=default_device())
     if trajectory.num_chunks <= FIRST_TIMED_CHUNK:
         raise ValueError("the camera path is too short for steady-state chunks")
     pipe = load_pipeline(args, world, rank)

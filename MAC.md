@@ -137,6 +137,64 @@ What changed for LingBot:
 | `from_pretrained(device=None)` left the refiner/decoder on CPU | The device is resolved once at the top (`default_device()`) |
 | Demo memory stats call `torch.cuda` | MPS reports `current_allocated_memory` / `driver_allocated_memory` |
 
+## Latency benchmarks
+
+`evaluation/latency/benchmark.py` (component profiles, Table 1) and `apps/lingbot/latency.py`
+(Fig. 5) run on one MPS device. Off CUDA the profilers time synchronized wall clock instead of
+CUDA events and run eager (no max-autotune, CUDA graphs, CUDA streams or Triton); attention is the
+Metal flash kernel and the split-KV setting is ignored. The protocol is otherwise upstream's.
+
+```bash
+.venv/bin/python evaluation/latency/benchmark.py ff-s --output-dir outputs/latency/ff-s_mps
+.venv/bin/python apps/lingbot/latency.py --model lingbot-1.3b --lingbot-root upstream/lingbot-world-v2 \
+    --frames 253 --min-samples 16 --output outputs/fig5_mps/ff_1.3b.json
+```
+
+FastFrames-S, one step (one latent frame, 4 video frames) with a full 21-frame cache, M4 Max:
+
+| Component | M4 Max | B200 (README) |
+|---|---:|---:|
+| DiT evaluation, t=1000 | 1925.7 ms | 16.1 ms |
+| DiT evaluation, t=833 | 1893.4 ms | 16.2 ms |
+| KV refinement | 136.6 ms | 2.2 ms |
+| Pixel decoder | 57.2 ms | 0.9 ms |
+| **Total** | **4013 ms** | **35.4 ms** |
+
+For comparison, the Wan VAE decode that the baselines use instead of the pixel decoder takes
+5.4 s per latent frame here (shorter run: two streamed passes), ~95x the pixel decoder.
+
+LingBot 1.3B, one chunk (16 frames, 1 s of video) with a full 18-frame cache: **27.1 s** median
+(16 chunks, range 25.6-28.1 s) against 220.7 ms on a B200. The run uses 16-chunk videos
+(`--frames 253`) and 16 samples instead of upstream's 60-chunk videos and 30 samples: a
+60-chunk pass takes ~25 minutes here. Eager mode has nothing to compile, so one warm-up pass
+is enough off CUDA.
+
+Both sets of numbers were measured right after a reboot, with Photos' `mediaanalysisd` busy in
+the background, and the sustained 60 s windows run warmer than short bursts: short runs measured
+1.38 s per DiT evaluation and 94 ms per refinement. Treat them as +-30%.
+
+- **Memory cap.** By default MPS may allocate 1.7x its recommended working set and then swaps.
+  An early run of these profilers outgrew memory alongside a running demo server and stalled
+  the Mac into a watchdog panic (reboot). On MPS the profilers now cap PyTorch with
+  `torch.mps.set_per_process_memory_fraction`: 0.6 of the working set (~31 GB on 64 GB) for
+  `evaluation/latency`, 0.75 (~39 GB) for LingBot. Too little fails with a clean out-of-memory
+  error; raise it with `FASTFRAMES_MPS_MEMORY_FRACTION`. Peak driver memory measured: DiT 9.8 GB,
+  KV refinement 18.1 GB, pixel decoder 7.8 GB, LingBot 23 GB.
+- **No whole-clip VAE decode.** The VAE profile's untimed warm-up decoded all 21 latents at once;
+  off CUDA it's skipped (the streamed warm-up passes remain).
+- **LingBot frees cached memory.** Nothing in the LingBot pipeline returned allocator blocks: the
+  11 GB umT5 moved back to the CPU but its GPU blocks stayed reserved, and per-chunk temporaries
+  piled up (34 GB after chunk 0, past 45 GB in chunk 1). On MPS the pipeline now calls
+  `synchronize()` + `empty_cache()` after the prompt is encoded and after each chunk: 23 GB, flat.
+  This also applies to the demo; its turn timings above were measured before this change.
+- **Numerical checks.** The pixel-decoder profile's streaming output is bit-identical to the
+  clip-level decoder. The refinement profile's fast path differs from the release refinement by
+  1.6% / 1.9% relative L2 (K / V); a CPU run gives 1.5% / 1.8%, so that's the BF16 fast path
+  itself, not MPS.
+
+Not ported: the multi-GPU rows (`--gpus 8`, NVLink symmetric memory), the 720p/14B rows, and the
+Causal Forcing++ / Self-Forcing baseline DiTs (`baselines.py`, needs their upstream clones).
+
 ## What was changed for FastFrames-S (see `git diff`)
 
 | Problem on Mac | Fix |
@@ -150,6 +208,6 @@ What changed for LingBot:
 | T5 built with random FP32 init (48 s, 22 GB RAM) before loading bf16 weights | Built on the meta device and assigned the checkpoint (same result) |
 | OpenH264 binary is linux64-only (ctypes) | Non-Linux `save_video` uses ffmpeg/libx264, BT.601 limited range, faststart |
 
-Not ported: training (NCCL, Triton flex_attention, CUDA RNG state), the latency benchmark, and
-FastFrames-L (14B: ~28 GB DiT + ~26 GB KV cache + T5 does not fit in 64 GB without offloading),
-multi-device LingBot (`--gpus 8`, torchrun), and the LingBot latency benchmarks.
+Not ported: training (NCCL, Triton flex_attention, CUDA RNG state), FastFrames-L (14B: ~28 GB DiT
++ ~26 GB KV cache + T5 does not fit in 64 GB without offloading), multi-device LingBot
+(`--gpus 8`, torchrun), and the multi-GPU and baseline latency rows.
