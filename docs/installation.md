@@ -1,5 +1,8 @@
 # Installation and checkpoints
 
+> **Apple Silicon Mac:** don't run `uv sync` (it installs CUDA wheels). Follow the setup in
+> [MAC.md](../MAC.md) instead; it covers FastFrames-S, the LingBot demo and the latency benchmarks.
+
 Use Linux x86-64 with an NVIDIA GPU and a CUDA 12.8-compatible driver. Run all
 commands from the repository root. `uv` installs Python 3.10 and the pinned
 PyTorch 2.9.1 / CUDA 12.8 environment:

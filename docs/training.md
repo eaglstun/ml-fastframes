@@ -1,6 +1,6 @@
 # Training
 
-Training uses NVIDIA B200 GPUs. Run from the repository root after
+Training uses NVIDIA B200 GPUs (it isn't ported to Apple Silicon). Run from the repository root after
 [installation](installation.md), with a config from [`configs/`](../configs/):
 
 ```bash

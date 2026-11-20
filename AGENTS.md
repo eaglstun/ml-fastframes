@@ -40,7 +40,7 @@ targets Linux + NVIDIA.
     --prompt "A corgi surfing a wave at sunset" --seed 0 --output outputs/corgi.mp4
 ```
 
-Expected on an M4 Max: ~45-50 s per video (flash attention; ~65-85 s with `FASTFRAMES_MPS_ATTN=sdpa`), an 81-frame 832×480 16 fps H.264 file, ~20 GB peak.
+Expected on an M4 Max: ~45-50 s per video (flash attention; ~65-85 s with `FASTFRAMES_MPS_ATTN=sdpa`), an 81-frame 832×480 16 fps H.264 file, ~18 GB peak.
 There are no unit tests for the inference path. Verify a change by:
 
 1. Generating with a fixed prompt and seed, before and after the change.

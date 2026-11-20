@@ -4,7 +4,9 @@ FastFrames accelerates LingBot-World v2 1.3B with KV refinement, a streaming pix
 and optimized inference. LingBot-World v2 code and weights follow their upstream
 [CC BY-NC-SA 4.0 license](../LICENSE_LINGBOT); FastFrames code uses the
 [Apple Sample Code License](../LICENSE).
-Run commands from the repository root.
+Run commands from the repository root. On an Apple Silicon Mac, the 1.3B demo, `generate.py`
+and `latency.py` run on one device through MPS; see
+[MAC.md](../MAC.md#lingbot-camera-control-interactive-demo) for setup and numbers.
 
 The default checkpoint directory is `checkpoints/`. Override locations with
 `--checkpoint-dir`, `--lingbot-root`, `--lingbot-checkpoint` or `--assets-dir`.
