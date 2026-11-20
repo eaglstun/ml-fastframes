@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from .mps_conv3d import patch_conv3d_class
+
 __all__ = ['WanVAE_', 'VideoVAE', 'load_wan_vae']
 
 CACHE_T = 2
@@ -36,6 +38,10 @@ class CausalConv3d(nn.Conv3d):
         x = F.pad(x, padding)
 
         return super().forward(x)
+
+
+if torch.backends.mps.is_available():
+    patch_conv3d_class(CausalConv3d)  # MPS conv3d is ~4x slower than per-tap conv2d (mps_conv3d.py)
 
 
 class RMS_norm(nn.Module):
