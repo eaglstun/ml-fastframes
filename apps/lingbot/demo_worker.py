@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import multiprocessing as mp
+import os
 import queue
 import tempfile
 import time
@@ -50,6 +51,8 @@ def _worker(rank, config, commands, replies, rendezvous):
         if cuda:
             torch.cuda.reset_peak_memory_stats()
         keys = camera = None
+        # MPS/CPU: encode the next chunk's VAE condition between turns (LINGBOT_DEMO_PREFETCH=0 disables)
+        prefetch = not cuda and os.environ.get("LINGBOT_DEMO_PREFETCH", "1") != "0"
         while True:
             request = commands.get()  # No GPU collective is pending during user idle.
             op = request["op"]
@@ -127,6 +130,10 @@ def _worker(rank, config, commands, replies, rendezvous):
                           "reserved_bytes": reserved, "peak_allocated_bytes": allocated,
                           "peak_reserved_bytes": reserved}
             replies.put({"rank": rank, "result": result, "memory": memory})
+            if prefetch and op in ("start", "step"):
+                # The VAE condition of the next chunk doesn't depend on the action: encode it while
+                # the player decides (MPS: ~4 s per chunk), so the next turn doesn't wait for it.
+                pipe.prefetch_condition()
             if cuda:
                 torch.cuda.reset_peak_memory_stats()
     except BaseException:
