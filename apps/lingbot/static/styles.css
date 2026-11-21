@@ -87,6 +87,8 @@ button, a, input, textarea, select, summary, [tabindex] { -webkit-tap-highlight-
 .block-counter span { color: #c7d2bf; }
 .stage-caption { display: flex; justify-content: space-between; gap: 16px; color: var(--faint); font-size: 10px; margin: 10px 2px 0; line-height: 1.5; }
 .stage-caption i { font-style: normal; margin: 0 8px; }
+.recording-link { color: var(--accent); margin-left: 8px; text-decoration: none; }
+.recording-link:hover { text-decoration: underline; }
 .control-panel { min-width: 0; border-left: 1px solid var(--line); background: #101510; padding: 20px 24px; }
 .panel-section + .panel-section { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .section-heading { display: flex; align-items: center; gap: 9px; margin-bottom: 14px; }
@@ -109,6 +111,16 @@ textarea::placeholder { color: var(--faint); }
 kbd { font-family: var(--mono); }
 .prompt-footer kbd { font-size: 8px; }
 .session-row { display: flex; align-items: stretch; gap: 8px; margin-top: 10px; height: 43px; }
+.size-field { margin-top: 12px; }
+.size-field > .field-label { display: block; margin-bottom: 7px; }
+.size-toggle { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.size-toggle button { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px; background: #161d14; text-align: left; cursor: pointer; }
+.size-toggle button strong { font-size: 11px; font-weight: 500; }
+.size-toggle button small { font: 8px var(--mono); letter-spacing: 0.5px; color: var(--faint); }
+.size-toggle button[aria-checked="true"] { border-color: var(--accent); background: #1d2a18; }
+.size-toggle button[aria-checked="true"] small { color: var(--accent); }
+.size-toggle button:disabled { opacity: 0.5; cursor: default; }
+.size-hint { margin: 7px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; min-height: 15px; }
 .seed-field { display: flex; flex-wrap: wrap; align-items: center; position: relative; border: 1px solid var(--line); border-radius: 7px; padding: 6px 30px 5px 10px; width: 114px; flex-shrink: 0; }
 .seed-field > span { width: 100%; font: 7px var(--mono); letter-spacing: 1px; color: var(--faint); }
 .seed-field input { border: 0; background: none; font: 11px var(--mono); width: 74px; padding: 0; appearance: textfield; -moz-appearance: textfield; }

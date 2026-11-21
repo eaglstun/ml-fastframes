@@ -32,6 +32,7 @@ from websockets.datastructures import Headers  # noqa: E402
 from websockets.exceptions import ConnectionClosed  # noqa: E402
 from websockets.http11 import Response  # noqa: E402
 
+from apps.lingbot.demo_recording import FPS, VIDEO_NAME, save_recording  # noqa: E402
 from apps.lingbot.demo_waiting_room import WaitingRoom  # noqa: E402
 from apps.lingbot.demo_worker import ACTIONS, WorkerPool  # noqa: E402
 
@@ -40,6 +41,16 @@ STATIC = Path(__file__).with_name("static")
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP")  # decoders allowed for uploaded images
 DEFAULT_SIZE = (832, 464)  # LingBot's trained frame size (width, height)
+# Sizes a visitor can pick per session on a Mac (one device, eager): the worker rebuilds the
+# size-dependent buffers around the loaded weights. CUDA keeps its single, warmed-up size.
+SESSION_SIZES = ((832, 464), (576, 320), (416, 240))
+
+
+def session_sizes(default, gpus):
+    """``default`` first, then the other per-session sizes where switching is supported."""
+    if gpus != 1 or sys.platform != "darwin":
+        return [tuple(default)]
+    return [tuple(default)] + [size for size in SESSION_SIZES if size != tuple(default)]
 
 
 def parse_size(text):
@@ -88,7 +99,18 @@ def prepare_image(raw, size=DEFAULT_SIZE):
         raise ValueError("Could not read this image; use JPEG, PNG or WebP") from exc
 
 
-def start_arguments(payload, examples, size=DEFAULT_SIZE):
+def start_arguments(payload, examples, size=DEFAULT_SIZE, sizes=None):
+    """Validated start request; ``size``: the default, ``sizes``: what a visitor may choose."""
+    requested = payload.get("size")
+    if requested is not None:
+        sizes = [tuple(s) for s in (sizes or [size])]
+        try:
+            width, height = (int(v) for v in str(requested).lower().split("x"))
+        except ValueError:
+            raise ValueError("Choose one of the offered frame sizes") from None
+        if (width, height) not in sizes:
+            raise ValueError("Choose one of the offered frame sizes")
+        size = (width, height)
     prompt = payload.get("prompt", "")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 1600:
         raise ValueError("Enter a prompt of 1–1600 characters")
@@ -113,7 +135,7 @@ def start_arguments(payload, examples, size=DEFAULT_SIZE):
         if not isinstance(example, str) or example not in examples:
             raise ValueError("Choose an example or upload a start image")
         raw = examples[example]["path"].read_bytes()
-    return {"prompt": prompt.strip(), "seed": seed, "image": prepare_image(raw, size)}
+    return {"prompt": prompt.strip(), "seed": seed, "image": prepare_image(raw, size), "size": list(size)}
 
 
 @dataclass
@@ -128,11 +150,18 @@ class Session:
     actions: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=1))
     displayed: asyncio.Event = field(default_factory=asyncio.Event)
     generation_task: asyncio.Task | None = None
+    websocket: object = None
+    started: float = field(default_factory=time.time)
+    settings: dict = field(default_factory=dict)  # prompt, seed, size and start image, for the recording
+    recorded: list = field(default_factory=list)  # JPEG frames in playback order
+    history: list = field(default_factory=list)  # camera action of every chunk
 
 
 class DemoApplication:
-    def __init__(self, pool, examples, *, idle_seconds=120):
+    def __init__(self, pool, examples, *, idle_seconds=120, save_dir=None):
         self.pool, self.examples = pool, examples
+        self.save_dir = Path(save_dir) if save_dir else None  # None: sessions aren't recorded
+        self.saving = set()  # recordings being written; shutdown waits for them
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lingbot")
         self.active = None
         self.closed = False
@@ -161,8 +190,10 @@ class DemoApplication:
         room = self.waiting_room
         room.connect(connection_id, websocket)
         try:
-            await self._send(websocket, {"type": "hello", "gpus": self.pool.config["gpus"],
-                                         "ready": self.pool.ready})
+            config = self.pool.config
+            sizes = [list(size) for size in config.get("sizes") or [config.get("size", DEFAULT_SIZE)]]
+            await self._send(websocket, {"type": "hello", "gpus": config["gpus"], "ready": self.pool.ready,
+                                         "sizes": sizes})
             await self._send(websocket, room.state(connection_id))
             async for raw in websocket:
                 try:
@@ -184,7 +215,8 @@ class DemoApplication:
         room = self.waiting_room
         if kind == "start":
             # Validate before reserving the GPU; private inputs aren't broadcast.
-            args = start_arguments(payload, self.examples, self.pool.config.get("size", DEFAULT_SIZE))
+            config = self.pool.config
+            args = start_arguments(payload, self.examples, config.get("size", DEFAULT_SIZE), config.get("sizes"))
             await room.start(websocket, connection_id, args)
         elif kind == "join_queue":
             await room.join(connection_id)
@@ -220,7 +252,9 @@ class DemoApplication:
 
     async def _start_session(self, websocket, connection_id, args):
         await self._stop_session(connection_id)
-        active = Session(connection_id)
+        active = Session(connection_id, websocket=websocket,
+                         settings={"prompt": args["prompt"], "seed": args["seed"], "image": args["image"],
+                                   "size": tuple(args.get("size") or self.pool.config.get("size", DEFAULT_SIZE))})
         self.active = active
         try:
             await self._send(websocket, {"type": "status", "state": "preparing",
@@ -253,6 +287,8 @@ class DemoApplication:
                 # Previews go out before their chunk's frames
                 await asyncio.gather(*(asyncio.wrap_future(send) for send in sends))
                 frames = batch.pop("frames")
+                active.recorded.extend(frames)
+                active.history.append(action)
                 active.chunk = batch["chunk_index"]
                 active.terminal = batch["terminal"]
                 active.frame_sequence += len(frames)
@@ -309,13 +345,42 @@ class DemoApplication:
             await asyncio.gather(task, return_exceptions=True)
         await self._call("stop")
         self.active = None
+        if self.save_dir is not None and active.recorded:
+            task = asyncio.create_task(self._save_recording(active))
+            self.saving.add(task)
+            task.add_done_callback(self.saving.discard)
         if notify is not None:
             await self._send(notify, {"type": "status", "state": "stopped", "message": "World stopped"})
+
+    async def _save_recording(self, session):
+        """Write the ended session's video (off the event loop) and tell its page where it is."""
+        settings = session.settings
+        try:
+            path = await asyncio.get_running_loop().run_in_executor(None, lambda: save_recording(
+                self.save_dir, session.recorded, prompt=settings["prompt"], seed=settings["seed"],
+                size=settings["size"], actions=session.history, image=settings.get("image"),
+                started=session.started))
+        except Exception as exc:
+            LOGGER.exception("Could not save the session video")
+            message = {"type": "recording", "status": "failed", "message": f"Could not save the video: {exc}"}
+        else:
+            LOGGER.info("Saved %s (%d frames)", path, len(session.recorded))
+            message = {"type": "recording", "status": "saved", "url": f"/videos/{path.name}", "name": path.name,
+                       "path": str(path.resolve()), "frames": len(session.recorded),
+                       "width": settings["size"][0], "height": settings["size"][1],
+                       "seconds": round(len(session.recorded) / FPS, 1)}
+        if session.websocket is not None:
+            try:
+                await self._send(session.websocket, message)
+            except ConnectionClosed:
+                pass
 
     async def shutdown(self):
         if self.closed:
             return
         await self.waiting_room.shutdown()
+        if self.saving:  # finish writing recordings (stopping the server stops its sessions)
+            await asyncio.gather(*self.saving, return_exceptions=True)
         await asyncio.get_running_loop().run_in_executor(self.executor, self.pool.close)
         self.executor.shutdown(wait=True)
         self.closed = True
@@ -344,6 +409,12 @@ class DemoApplication:
         if path in files:
             name, mime = files[path]
             return response(200, (STATIC / name).read_bytes(), mime)
+        if path.startswith("/videos/") and self.save_dir is not None:
+            name = path.removeprefix("/videos/")
+            video = self.save_dir / name
+            if VIDEO_NAME.match(name) and video.is_file():
+                return response(200, video.read_bytes(), "video/mp4")
+            return response(404, b"Not found", "text/plain")
         if path == "/favicon.ico":
             return response(204, b"", "image/x-icon")
         return response(404, b"Not found", "text/plain")
@@ -356,7 +427,8 @@ def response(status, body, mime="application/json"):
 
 
 async def run(args):
-    app = DemoApplication(WorkerPool(vars(args)), examples_from(args.lingbot_root), idle_seconds=args.idle_timeout)
+    app = DemoApplication(WorkerPool(vars(args)), examples_from(args.lingbot_root), idle_seconds=args.idle_timeout,
+                          save_dir=args.save_dir or None)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -415,12 +487,16 @@ def main():
     parser.add_argument("--idle-timeout", type=float, default=120,
                         help="idle seconds before giving a waiting visitor a turn")
     parser.add_argument("--profile-vram", metavar="JSON", help="profile startup, generation and restarts, then exit")
+    parser.add_argument("--save-dir", default="outputs/lingbot_demo", metavar="DIR",
+                        help="save every session's video (MP4 + start image + JSON) here when it ends; "
+                             "'' disables (default: outputs/lingbot_demo)")
     parser.add_argument("--size", type=parse_size, default=DEFAULT_SIZE, metavar="WxH",
                         help="frame size (default 832x464, the trained size). Smaller is much faster and out "
                              "of distribution: 576x320 is ~4x faster per chunk and softer; 416x240 melts")
     args = parser.parse_args()
     if args.size != DEFAULT_SIZE and args.gpus != 1:
         parser.error("--size other than 832x464 was only tried on one device")
+    args.sizes = session_sizes(args.size, args.gpus)  # offered to visitors; --size is the default
     if not args.lingbot_root or not Path(args.lingbot_root, "wan", "modules", "model_fast.py").is_file():
         parser.error("set LINGBOT_WORLD_ROOT or --lingbot-root to the pinned upstream clone "
                      "(see docs/lingbot.md)")

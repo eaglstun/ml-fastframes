@@ -5,6 +5,7 @@
 """Resident, single-node LingBot workers. Idle ranks wait on CPU queues, not NCCL."""
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import json
@@ -30,7 +31,7 @@ def _worker(rank, config, commands, replies, rendezvous):
     from apps.lingbot import conditioning
     from apps.lingbot.conditioning import KeyboardCamera, LiveCamera
     from apps.lingbot.pipeline import FastFramesLingBot, configure_backends
-    from fastframes.device import default_device, synchronize
+    from fastframes.device import default_device, release_mps_cache, synchronize
 
     pipe = None
     device = default_device()
@@ -66,7 +67,22 @@ def _worker(rank, config, commands, replies, rendezvous):
             if op == "shutdown":
                 break
             if op == "start":
+                size = tuple(request.get("size") or (conditioning.WIDTH, conditioning.HEIGHT))
+                if pipe is not None and size != (conditioning.WIDTH, conditioning.HEIGHT):
+                    # Another frame size: rebuild the size-dependent buffers around the loaded weights.
+                    # Free the old ones first (~6 GB of caches at 832x464) so both never coexist.
+                    if cuda:
+                        raise ValueError("switching the frame size is only supported off CUDA")
+                    parts = pipe.parts()
+                    pipe.close()
+                    pipe = None
+                    gc.collect()
+                    release_mps_cache(device)
+                    conditioning.set_size(*size)
+                    pipe = FastFramesLingBot(**parts)
+                    fingerprint = None
                 if pipe is None:
+                    conditioning.set_size(*size)
                     root = Path(config["checkpoint_dir"])
                     pipe = FastFramesLingBot.from_pretrained(
                         "lingbot-1.3b", lingbot_root=config["lingbot_root"],
@@ -76,7 +92,7 @@ def _worker(rank, config, commands, replies, rendezvous):
                         checkpoint_dir=root / "lingbot-1.3b", world=world, rank=rank,
                         compile=cuda, graphs=cuda)  # torch.compile/CUDA graphs are CUDA-only here
                     keys, camera = KeyboardCamera(), LiveCamera(device=device)
-                next_fingerprint = (hashlib.sha256(request["image"]).hexdigest(), request["prompt"])
+                next_fingerprint = (hashlib.sha256(request["image"]).hexdigest(), request["prompt"], size)
                 if fingerprint == next_fingerprint:
                     pipe.restart(seed=request["seed"])
                 else:

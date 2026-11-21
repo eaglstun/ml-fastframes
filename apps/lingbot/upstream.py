@@ -128,13 +128,17 @@ def _load_t5(cls, config, checkpoint_path, tokenizer_path):
     from wan.modules.t5 import umt5_xxl
     from wan.modules.tokenizers import HuggingfaceTokenizer
 
+    def build_model():
+        model = umt5_xxl(encoder_only=True, return_tokenizer=False, dtype=config.t5_dtype, device="meta")
+        state = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=True)
+        model.load_state_dict({k: v.to(config.t5_dtype) for k, v in state.items()}, assign=True)
+        return model.eval().requires_grad_(False)
+
     encoder = cls.__new__(cls)
     encoder.text_len, encoder.dtype, encoder.device = config.text_len, config.t5_dtype, torch.device("cpu")
     encoder.checkpoint_path, encoder.tokenizer_path = checkpoint_path, tokenizer_path
-    model = umt5_xxl(encoder_only=True, return_tokenizer=False, dtype=config.t5_dtype, device="meta")
-    state = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=True)
-    model.load_state_dict({k: v.to(config.t5_dtype) for k, v in state.items()}, assign=True)
-    encoder.model = model.eval().requires_grad_(False)
+    encoder.model = build_model()
+    encoder.build_model = build_model  # rebuilds it (~1 s, memory-mapped) after text_context dropped it
     encoder.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=config.text_len, clean="whitespace")
     return encoder
 

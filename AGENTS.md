@@ -22,6 +22,9 @@ targets Linux + NVIDIA.
   `demo_worker.py` (browser demo, websocket at `/ws`), `pipeline.py` (chunked rollout),
   `upstream.py` (imports the pinned clone in `upstream/lingbot-world-v2`; treat that clone as
   read-only third-party code and patch around it here).
+- `apps/lingbot/web/`: TypeScript source of the demo page (`src/app.ts`). It compiles to
+  `apps/lingbot/static/app.js`, which is committed: edit the `.ts`, then `npm run build` and
+  `npm run verify` there. `npm run e2e` drives a running demo in headless Chrome.
 
 ## Environment
 
@@ -71,8 +74,11 @@ There are no unit tests for the inference path. Verify a change by:
 - **The per-frame `synchronize()` + `empty_cache()`** in `FastFrames.rollout` keeps the
   allocator from hoarding odd-sized buffers. `empty_cache()` without the sync frees nothing
   while command buffers are still in flight.
-- **Unified memory is shared** between CPU and GPU. umT5 (11 GB) gets moved to CPU after
-  prompts are encoded, and it's built on the meta device (random FP32 init cost 48 s and 22 GB).
+- **Unified memory is shared** between CPU and GPU. umT5 (11 GB) is built on the meta device from
+  the memory-mapped checkpoint (random FP32 init cost 48 s and 22 GB). FastFrames-S moves it to CPU
+  after encoding; LingBot off CUDA drops it after each prompt and rebuilds it for the next
+  (`text_context(..., keep=False)`, +0.5 s per prompt change, bit-identical embeddings): a resident
+  copy cost ~7 GB of available memory during a demo session.
 - **LingBot conditioning is encoded lazily** (`conditioning.LazyImageCondition`), one latent per
   chunk. Encoding the whole horizon up front on MPS corrupts the final latent (0.4 max abs error
   vs CPU) and costs minutes plus ~40 GB. Check any change here against a CPU encode.

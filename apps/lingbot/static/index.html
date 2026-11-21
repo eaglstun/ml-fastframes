@@ -10,7 +10,7 @@
     <meta name="description" content="Explore a world with LingBot 1.3B, running on your own GPUs." />
     <title>LingBot · FastFrames</title>
     <link rel="stylesheet" href="styles.css" />
-    <script src="app.js" defer></script>
+    <script src="app.js" type="module"></script>
   </head>
   <body>
     <header class="topbar">
@@ -59,7 +59,7 @@
           </div>
           <div class="transport"><span class="transport-light" id="transportLight" aria-hidden="true"></span><span id="stateLabel" role="status">Connecting to your server…</span><span class="block-counter"><span id="chunkCount">0</span> BLOCKS</span></div>
         </div>
-        <p class="stage-caption"><span>Run locally. Explore freely.</span><span>WASD to move <i>·</i> ← → to look around</span></p>
+        <p class="stage-caption"><span>Run locally. Explore freely. <a class="recording-link" id="recordingLink" hidden></a></span><span>WASD to move <i>·</i> ← → to look around</span></p>
       </section>
 
       <aside class="control-panel" aria-label="Generation controls">
@@ -71,6 +71,7 @@
           <select id="exampleSelect" aria-label="Example starting image"><option value="">Loading examples…</option></select>
           <label class="field-label prompt-label" for="promptInput">PROMPT</label>
           <div class="prompt-box"><textarea id="promptInput" rows="4" maxlength="1600" placeholder="Describe the world you want to explore…"></textarea><span class="prompt-footer"><span><kbd>Ctrl / ⌘</kbd> <kbd>↵</kbd> to start</span><span id="promptCount">0 / 1600</span></span></div>
+          <div class="size-field" id="sizeField" hidden><span class="field-label">FRAME SIZE</span><div class="size-toggle" id="sizeToggle" role="radiogroup" aria-label="Frame size"></div><p class="size-hint" id="sizeHint"></p></div>
           <div class="session-row"><label class="seed-field" for="seedInput"><span>SEED</span><input id="seedInput" type="number" min="0" max="4294967295" step="1" value="42" /><button id="randomSeedButton" type="button" aria-label="Randomize seed" title="Randomize seed">↻</button></label><button class="primary-button" id="startButton" type="button" disabled><span aria-hidden="true">▶</span><span id="startButtonLabel">Start world</span></button><button class="stop-button" id="stopButton" type="button" aria-label="Stop session" title="Stop session" disabled><span aria-hidden="true">■</span></button></div>
         </section>
 
