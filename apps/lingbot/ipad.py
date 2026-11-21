@@ -17,6 +17,10 @@ The iPad mirrors the cache: it computes its own camera rows from its slice of th
 evicts like ``FastFramesLingBot._evict``, zeroes on restart, and receives the refined rows of each
 chunk (``sync_rows``; the demo does it between turns) and the text K/V of each prompt.
 
+The exchange hides behind attention: once a block's own K/V are on their way, both sides attend over
+the cache's older rows while the other side's are in flight, then over this chunk's rows, and merge the
+two by their log-sum-exp (``overlap``; the first chunk, with no older rows, waits as before).
+
 Frames both ways: little-endian u32 header length, a JSON header
 ``{"op", "layer", "meta", "arrays": [{"name", "shape", "dtype"}]}``, then the arrays' bytes in order.
 
@@ -34,6 +38,8 @@ import threading
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+from fastframes.wan.mps_flash_attention import flash_attention_lse, merge_attention
 
 from . import dit as lingbot_dit
 from .conditioning import CHUNK
@@ -133,11 +139,10 @@ def block_pre(block, value, qkv_weight, qkv_bias, rope, time_e0, heads):
     return e, query, key, val.view(1, tokens, heads, dim // heads)
 
 
-def block_post(block, value, e, query, cache_k, cache_v, end, text_k, text_v, cam):
-    """``LingBotDiT._block`` from attention on, for one share's tokens (cache rows already written)."""
+def block_post(block, value, e, attended, text_k, text_v, cam):
+    """``LingBotDiT._block`` after self-attention, for one share's tokens."""
     tokens, dim = value.shape[1], value.shape[2]
     a = block.self_attn
-    attended = attention(query, cache_k[:, :end], cache_v[:, :end], 1)
     value = value + F.linear(attended.reshape(1, tokens, dim), a.o.weight, a.o.bias) * e[2]
     value = (1.0 + cam[0]) * value + cam[1]
     cross = block.cross_attn
@@ -153,7 +158,7 @@ class IPadAssist:
     # Shares move in steps of this many tokens: each new share compiles new graphs on the iPad
     STEP = 128
 
-    def __init__(self, pipe, host, port=DEFAULT_PORT, share=0.55, adaptive=True):
+    def __init__(self, pipe, host, port=DEFAULT_PORT, share=0.55, adaptive=True, overlap=True):
         dit = pipe.dit
         if dit.world != 1:
             raise ValueError("iPad assist runs with a single-device pipeline")
@@ -161,6 +166,8 @@ class IPadAssist:
         self.tokens = lingbot_dit.TOKENS
         self.n = self._quantize(self.tokens - round(self.tokens * share))  # this Mac's tokens: [0, n)
         self.adaptive = adaptive
+        # Attend over the older cache rows while the K/V are in flight (needs the Metal flash kernel)
+        self.overlap = overlap and pipe.device.type == "mps"
         self.link = Link(host, port, pipe.device)
         self.stats = {"passes": 0, "wait": 0.0, "shares": [], "thermal": None}
         self._rates = []  # this chunk's passes: (Mac tokens/s, iPad tokens/s)
@@ -181,10 +188,11 @@ class IPadAssist:
         self._rates = []
 
     @classmethod
-    def attach(cls, pipe, host, port=DEFAULT_PORT, share=0.55, adaptive=True):
+    def attach(cls, pipe, host, port=DEFAULT_PORT, share=0.55, adaptive=True, overlap=True):
         """Connect, send the weights, and route ``pipe``'s DiT passes and cache events through the iPad.
-        ``share``: the iPad's starting fraction of the tokens; ``adaptive`` rebalances it every chunk."""
-        assist = cls(pipe, host, port, share, adaptive)
+        ``share``: the iPad's starting fraction of the tokens; ``adaptive`` rebalances it every chunk;
+        ``overlap`` hides the K/V exchange behind attention over the older cache rows."""
+        assist = cls(pipe, host, port, share, adaptive, overlap)
         dit = pipe.dit
         assist._originals = {name: getattr(dit, name) for name in ("_run", "begin_chunk", "set_context")}
         dit._run = assist.run
@@ -295,27 +303,46 @@ class IPadAssist:
         rows = end - tokens
         began = time.perf_counter()
         value0 = dit._patch_run()
-        self.link.send(encode("pass", meta={"end": end}, arrays=[("time_e0", dit.time_e0), ("value", value0[:, n:])]))
+        overlap = self.overlap and rows > 0  # the first chunk has no older rows to attend over
+        self.link.send(encode("pass", meta={"end": end, "overlap": overlap},
+                              arrays=[("time_e0", dit.time_e0), ("value", value0[:, n:])]))
         value, waited = value0[:, :n], 0.0
         for i, block in enumerate(dit.model.blocks):
+            cache_k, cache_v = dit.cache_k[i], dit.cache_v[i]
             e, query, key, val = block_pre(block, value, *dit.qkv[i], dit.rope[:n], dit.time_e0, dit.heads)
             encoding = time.perf_counter()
-            self.link.send(encode("kv", layer=i, arrays=[("k", key), ("v", val)]))
+            if overlap:
+                # Copy the K/V out, then queue attention over the older rows behind the copy; the events
+                # commit both to the GPU, and only the copy is waited for before sending
+                kv = [("k", key.to("cpu", non_blocking=True)), ("v", val.to("cpu", non_blocking=True))]
+                copied = torch.mps.Event()
+                copied.record()
+                older = flash_attention_lse(query, cache_k[:, :rows], cache_v[:, :rows])
+                torch.mps.Event().record()
+                copied.synchronize()
+            else:
+                kv = [("k", key), ("v", val)]
+            self.link.send(encode("kv", layer=i, arrays=kv))
             self.link.timing["encode"] += time.perf_counter() - encoding
-            dit.cache_k[i][:, rows:rows + n] = rope_real(key, dit.rope[:n])
-            dit.cache_v[i][:, rows:rows + n] = val
+            cache_k[:, rows:rows + n] = rope_real(key, dit.rope[:n])
+            cache_v[:, rows:rows + n] = val
             start = time.perf_counter()
             _, theirs = self.link.read("kv", i)
             waited += time.perf_counter() - start
-            dit.cache_k[i][:, rows + n:end] = rope_real(theirs["k"], dit.rope[n:])
-            dit.cache_v[i][:, rows + n:end] = theirs["v"]
+            cache_k[:, rows + n:end] = rope_real(theirs["k"], dit.rope[n:])
+            cache_v[:, rows + n:end] = theirs["v"]
+            if overlap:
+                attended = merge_attention(*older, *flash_attention_lse(query, cache_k[:, rows:end],
+                                                                         cache_v[:, rows:end]), query.dtype)
+            else:
+                attended = attention(query, cache_k[:, :end], cache_v[:, :end], 1)
             if capture:  # canonical K/V of every token, for the KV refiner
                 dit.result.key[i][:, :n] = key
                 dit.result.key[i][:, n:] = theirs["k"]
                 dit.result.value[i][:, :n] = val
                 dit.result.value[i][:, n:] = theirs["v"]
-            value = block_post(block, value, e, query, dit.cache_k[i], dit.cache_v[i], end, dit.text_k[i],
-                               dit.text_v[i], dit.camera_params[i][:, :, :n])
+            value = block_post(block, value, e, attended, dit.text_k[i], dit.text_v[i],
+                               dit.camera_params[i][:, :, :n])
         start = time.perf_counter()
         header, result = self.link.read("result")
         waited += time.perf_counter() - start

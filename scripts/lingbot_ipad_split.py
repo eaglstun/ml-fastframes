@@ -60,6 +60,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--split-only", action="store_true", help="profile the split run alone (no Mac-alone runs)")
     parser.add_argument("--fixed-share", action="store_true", help="keep --ipad-share for every chunk")
+    parser.add_argument("--no-overlap", action="store_true",
+                        help="wait for each block's K/V before attending (the exchange not hidden)")
     parser.add_argument("--no-row-sync", action="store_true",
                         help="diagnostic: don't send the refined rows to the iPad (its frames go wrong)")
     args = parser.parse_args()
@@ -78,7 +80,8 @@ def main():
         print("Mac alone", flush=True)
         alone, alone_times = generate(pipe, image, prompt, trajectory)
     started = time.perf_counter()
-    assist = IPadAssist.attach(pipe, args.ipad, args.port, share=args.ipad_share, adaptive=not args.fixed_share)
+    assist = IPadAssist.attach(pipe, args.ipad, args.port, share=args.ipad_share, adaptive=not args.fixed_share,
+                               overlap=not args.no_overlap)
     if args.no_row_sync:
         assist.sync_rows = lambda read_frames: None
     print(f"with the iPad ({1 - assist.n / assist.tokens:.0%} of the tokens; setup "
