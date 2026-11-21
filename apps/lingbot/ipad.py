@@ -169,7 +169,9 @@ class IPadAssist:
         # Attend over the older cache rows while the K/V are in flight (needs the Metal flash kernel)
         self.overlap = overlap and pipe.device.type == "mps"
         self.link = Link(host, port, pipe.device)
-        self.stats = {"passes": 0, "wait": 0.0, "shares": [], "thermal": None}
+        # latency: per block, this Mac's send-to-receive time minus the iPad's arrival-to-send time (the
+        # exchange both ways, transfer and copies); summed over passes
+        self.stats = {"passes": 0, "wait": 0.0, "shares": [], "thermal": None, "latency": 0.0, "latency_blocks": 0}
         self._rates = []  # this chunk's passes: (Mac tokens/s, iPad tokens/s)
         self._setup()
 
@@ -306,15 +308,17 @@ class IPadAssist:
         overlap = self.overlap and rows > 0  # the first chunk has no older rows to attend over
         self.link.send(encode("pass", meta={"end": end, "overlap": overlap},
                               arrays=[("time_e0", dit.time_e0), ("value", value0[:, n:])]))
-        value, waited = value0[:, :n], 0.0
+        value, waited, turn, sent = value0[:, :n], 0.0, 0.0, 0.0
         for i, block in enumerate(dit.model.blocks):
             cache_k, cache_v = dit.cache_k[i], dit.cache_v[i]
             e, query, key, val = block_pre(block, value, *dit.qkv[i], dit.rope[:n], dit.time_e0, dit.heads)
             encoding = time.perf_counter()
             if overlap:
                 # Copy the K/V out, then queue attention over the older rows behind the copy; the events
-                # commit both to the GPU, and only the copy is waited for before sending
-                kv = [("k", key.to("cpu", non_blocking=True)), ("v", val.to("cpu", non_blocking=True))]
+                # commit both to the GPU, and only the copy is waited for before sending. A non-blocking
+                # copy of a non-contiguous MPS tensor (``val`` is a slice of the QKV output) comes back
+                # wrong (PyTorch 2.9): make it contiguous on the GPU first
+                kv = [(name, t.contiguous().to("cpu", non_blocking=True)) for name, t in (("k", key), ("v", val))]
                 copied = torch.mps.Event()
                 copied.record()
                 older = flash_attention_lse(query, cache_k[:, :rows], cache_v[:, :rows])
@@ -324,11 +328,16 @@ class IPadAssist:
                 kv = [("k", key), ("v", val)]
             self.link.send(encode("kv", layer=i, arrays=kv))
             self.link.timing["encode"] += time.perf_counter() - encoding
+            if i > 0:
+                turn -= sent
+            sent = time.perf_counter()
             cache_k[:, rows:rows + n] = rope_real(key, dit.rope[:n])
             cache_v[:, rows:rows + n] = val
             start = time.perf_counter()
             _, theirs = self.link.read("kv", i)
             waited += time.perf_counter() - start
+            if i > 0:  # the iPad's K/V of block i answer this Mac's of block i - 1
+                turn += time.perf_counter()
             cache_k[:, rows + n:end] = rope_real(theirs["k"], dit.rope[n:])
             cache_v[:, rows + n:end] = theirs["v"]
             if overlap:
@@ -352,4 +361,7 @@ class IPadAssist:
         self.stats["passes"] += 1
         self.stats["wait"] += waited
         self.stats["thermal"] = header["meta"].get("thermal")
+        if "turn_ms" in header["meta"]:
+            self.stats["latency"] += turn - header["meta"]["turn_ms"] / 1000
+            self.stats["latency_blocks"] += len(dit.model.blocks) - 1
         dit._post_run(torch.cat([value, result["value"].to(value.dtype)], 1), capture)

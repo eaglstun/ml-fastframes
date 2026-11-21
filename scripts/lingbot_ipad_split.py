@@ -93,6 +93,9 @@ def main():
     print(f"per pass on this Mac: encode K/V {per_pass['encode']:.2f} s (GPU sync + copy), waiting on the socket "
           f"{per_pass['socket']:.2f} s, decoding the iPad's {per_pass['decode']:.2f} s", flush=True)
     print("iPad share per chunk: " + " ".join(f"{share:.0%}" for share in shares), flush=True)
+    if assist.stats["latency_blocks"]:
+        print(f"exchange latency per block, both ways (transfer and copies): "
+              f"{assist.stats['latency'] / assist.stats['latency_blocks'] * 1000:.1f} ms", flush=True)
     if args.split_only:
         assist.detach()
         return
