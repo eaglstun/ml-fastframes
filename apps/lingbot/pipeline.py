@@ -169,9 +169,11 @@ class FastFramesLingBot:
         if latents % CHUNK or not CHUNK <= latents <= MAX_LATENTS:
             raise ValueError(f"latents must be a multiple of {CHUNK} in [{CHUNK}, {MAX_LATENTS}]")
         if prompt != self.prompt:
-            self.dit.set_context(text_context(self.upstream.text_encoder, prompt, self.device))
+            # Off CUDA the encoder is dropped after use and rebuilt for the next prompt (unified memory)
+            self.dit.set_context(text_context(self.upstream.text_encoder, prompt, self.device,
+                                              keep=self.device.type == "cuda"))
             self.prompt = prompt
-            release_mps_cache(self.device)  # umT5 (11 GB) went back to the CPU; return its GPU blocks
+            release_mps_cache(self.device)  # umT5 (11 GB) left the GPU; return its blocks
         self.condition = LazyImageCondition(self.upstream.vae, image, latents, self.device)
         self.latents = latents
         self.restart(seed=seed, noise=noise)
@@ -200,6 +202,9 @@ class FastFramesLingBot:
         interactive caller can run this while it waits for the next action (``step`` then reuses it)."""
         if self.condition is not None and self.chunk < self.num_chunks:
             self.condition.chunk(self.chunk)
+            # The VAE's full-size scratch blocks would otherwise stay cached through the player's
+            # think time and under the next chunk's DiT (~4 GB of MPS driver memory at 832x464).
+            release_mps_cache(self.device)
 
     def _evict(self, chunk):
         """Before writing ``chunk``: drop the oldest non-sink frames of a full cache (one shift per chunk)."""

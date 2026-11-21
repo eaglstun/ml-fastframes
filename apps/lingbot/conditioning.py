@@ -81,11 +81,22 @@ def set_size(width, height):
 DEFAULT_INTRINSICS = (502.9116, 503.10812, 415.77786, 239.77779)
 
 
-def text_context(text_encoder, prompt, device):
-    """umT5 embedding of ``prompt`` padded to 512 tokens, ``[512, 4096]`` BF16."""
+def text_context(text_encoder, prompt, device, *, keep=True):
+    """umT5 embedding of ``prompt`` padded to 512 tokens, ``[512, 4096]`` BF16.
+
+    ``keep=False`` drops the 11 GB encoder after use instead of copying it back to the CPU; the
+    next call rebuilds it from the memory-mapped checkpoint (``text_encoder.build_model``, ~1 s).
+    On unified memory (MPS) a resident copy kept ~7 GB less available to the system during a
+    session, which ran a 64 GB Mac down to ~6 GB free at 832x464.
+    """
+    if text_encoder.model is None:
+        text_encoder.model = text_encoder.build_model()
     text_encoder.model.to(device)
     raw = text_encoder([prompt], device)[0]
-    text_encoder.model.cpu()
+    if keep:
+        text_encoder.model.cpu()
+    else:
+        text_encoder.model = None
     return torch.cat([raw, raw.new_zeros(512 - raw.shape[0], raw.shape[1])])
 
 

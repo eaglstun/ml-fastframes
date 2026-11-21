@@ -145,7 +145,13 @@ so turn it off on a demo other people use if they shouldn't be recorded.
 
 Peak memory went from 83 GB (upstream conditioning) to 43 GB on a 2-chunk `generate.py` run; since
 the pipeline releases cached blocks after each chunk, `latency.py` holds a flat ~23 GB of driver
-memory (a 576x320 run peaks at ~13 GB).
+memory (a 576x320 run peaks at ~13 GB). The demo peaked ~7 GB higher until two changes: off CUDA the
+11 GB umT5 encoder is dropped after encoding a prompt and rebuilt from its memory-mapped
+checkpoint for the next one (+0.5 s per prompt change, bit-identical embeddings), and the MPS
+cache is released after the between-turn condition prefetch (~4 GB of VAE scratch blocks that
+otherwise sat under the next chunk). At 832x464 the lowest system-available memory during a
+7-chunk run went from 8.1 GB (of 46.2 GB at start) to 13.1 GB (of 44.0 GB): peak use 38.1 ->
+30.9 GB, with no measurable change in chunk time.
 
 ### Smaller frames for speed (`--size`)
 
