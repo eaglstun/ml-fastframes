@@ -56,6 +56,7 @@ const ui = {
     sizeField: byId("sizeField", HTMLDivElement),
     sizeToggle: byId("sizeToggle", HTMLDivElement),
     sizeHint: byId("sizeHint", HTMLParagraphElement),
+    recordingLink: byId("recordingLink", HTMLAnchorElement),
 };
 // ------------------------------------------------------------------ state
 const FRAME_MS = 1000 / 50;
@@ -142,6 +143,19 @@ function showPreview(message) {
     ui.previewLabel.textContent = `PREVIEW ${message.pass}/${message.passes}`;
     ui.previewLabel.hidden = false;
     status(`Generating · rough preview ${message.pass} of ${message.passes}`);
+}
+function showRecording(message) {
+    if (message.status === "failed") {
+        error(message.message);
+        return;
+    }
+    if (!message.url.startsWith("/videos/"))
+        return;
+    ui.recordingLink.href = message.url;
+    ui.recordingLink.download = message.name;
+    ui.recordingLink.textContent = `Saved ${message.seconds.toFixed(1)} s · ${message.width} × ${message.height} ↓`;
+    ui.recordingLink.title = `${message.frames} frames · saved on the server as ${message.path}`;
+    ui.recordingLink.hidden = false;
 }
 function resetTiming() {
     for (const element of [ui.modelLatency, ui.nonModelLatency, ui.totalLatency])
@@ -539,6 +553,9 @@ function handleMessage(message) {
             break;
         case "preview":
             showPreview(message);
+            break;
+        case "recording":
+            showRecording(message);
             break;
         case "error":
             error(message.message || "The server could not complete the request.");

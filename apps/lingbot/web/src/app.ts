@@ -34,8 +34,12 @@ interface PreviewMessage {
   type: "preview"; request_id: string | null; chunk_index: number; pass: number; passes: number; image: string;
 }
 interface ErrorMessage { type: "error"; code: string; message?: string }
+type RecordingMessage =  // the ended world's video, saved by the server (demo_recording.py)
+  | { type: "recording"; status: "saved"; url: string; name: string; path: string; frames: number; seconds: number;
+      width: number; height: number }
+  | { type: "recording"; status: "failed"; message: string };
 type ServerMessage = HelloMessage | QueueStateMessage | SessionMessage | StatusMessage | ChunkMessage
-  | PreviewMessage | ErrorMessage;
+  | PreviewMessage | ErrorMessage | RecordingMessage;
 
 type ClientMessage =
   | { type: "start"; prompt: string; seed: number; image?: string; example?: string; size?: string }
@@ -96,6 +100,7 @@ const ui = {
   sizeField: byId("sizeField", HTMLDivElement),
   sizeToggle: byId("sizeToggle", HTMLDivElement),
   sizeHint: byId("sizeHint", HTMLParagraphElement),
+  recordingLink: byId("recordingLink", HTMLAnchorElement),
 };
 
 // ------------------------------------------------------------------ state
@@ -195,6 +200,16 @@ function showPreview(message: PreviewMessage): void {
   ui.previewLabel.textContent = `PREVIEW ${message.pass}/${message.passes}`;
   ui.previewLabel.hidden = false;
   status(`Generating · rough preview ${message.pass} of ${message.passes}`);
+}
+
+function showRecording(message: RecordingMessage): void {
+  if (message.status === "failed") { error(message.message); return; }
+  if (!message.url.startsWith("/videos/")) return;
+  ui.recordingLink.href = message.url;
+  ui.recordingLink.download = message.name;
+  ui.recordingLink.textContent = `Saved ${message.seconds.toFixed(1)} s · ${message.width} × ${message.height} ↓`;
+  ui.recordingLink.title = `${message.frames} frames · saved on the server as ${message.path}`;
+  ui.recordingLink.hidden = false;
 }
 
 function resetTiming(): void {
@@ -543,6 +558,7 @@ function handleMessage(message: ServerMessage): void {
     case "status": handleStatus(message); break;
     case "chunk": state.metadata.push(message); break;
     case "preview": showPreview(message); break;
+    case "recording": showRecording(message); break;
     case "error":
       error(message.message || "The server could not complete the request.");
       cancelPlayback();

@@ -136,6 +136,13 @@ so you explore shot by shot; at 576x320 it's ~5-6x, close to interactive, at low
 [Smaller frames](#smaller-frames-for-speed---size)). Before the performance work below, a first
 session took 24-34 s per turn at 832x464 with nothing on screen in between.
 
+Every world is saved when it ends (Stop, restart, disconnect, idle timeout or the end of the
+horizon): the server pipes the JPEG frames it already sent to the page through ffmpeg into an H.264
+MP4 at 16 fps, and writes the start image (PNG) and a JSON file with the prompt, seed, size and
+camera actions next to it, in `outputs/lingbot_demo/` (`--save-dir DIR`; `--save-dir ''` turns it
+off). The page links to the video when it's written. That includes uploaded images and prompts,
+so turn it off on a demo other people use if they shouldn't be recorded.
+
 Peak memory went from 83 GB (upstream conditioning) to 43 GB on a 2-chunk `generate.py` run; since
 the pipeline releases cached blocks after each chunk, `latency.py` holds a flat ~23 GB of driver
 memory (a 576x320 run peaks at ~13 GB).

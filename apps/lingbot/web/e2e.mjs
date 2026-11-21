@@ -149,6 +149,18 @@ try {
   await evaluate(`document.getElementById("stopButton").click()`);
   await until("session stopped", `!document.getElementById("startButton").disabled && document.getElementById("startButtonLabel").textContent === "Start world"`, 30000);
   log("final:", JSON.stringify(await evaluate(ui)));
+  // The server saves the ended world's video and the page links to it.
+  // Restarts save the earlier worlds too; wait for the link to the world that was just stopped.
+  const lastSize = (await evaluate(`document.getElementById("resolutionLabel").textContent`)).replace(" × ", "x");
+  const link = await until(`recording link for the ${lastSize} world`, `(() => { const a = document.getElementById("recordingLink");
+    return a && !a.hidden && a.href.includes("-${lastSize}") ? {text: a.textContent, href: a.href, title: a.title} : null; })()`,
+    120000);
+  log("recording:", link.text, "·", link.title);
+  const video = await evaluate(`fetch(${JSON.stringify(link.href)}).then(async (r) => ({status: r.status,
+    type: r.headers.get("content-type"), bytes: (await r.arrayBuffer()).byteLength}))`);
+  log("downloaded:", JSON.stringify(video));
+  if (video.status !== 200 || video.type !== "video/mp4" || video.bytes < 10000) throw new Error("recording download failed");
+  await shot("6_saved.png");
   log("previews seen:", [...previews].join(" | ") || "none");
   log(problems.length ? `PROBLEMS:\n  ${problems.join("\n  ")}` : "no page exceptions or console errors");
   process.exitCode = problems.length ? 1 : 0;

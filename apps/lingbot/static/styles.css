@@ -87,6 +87,8 @@ button, a, input, textarea, select, summary, [tabindex] { -webkit-tap-highlight-
 .block-counter span { color: #c7d2bf; }
 .stage-caption { display: flex; justify-content: space-between; gap: 16px; color: var(--faint); font-size: 10px; margin: 10px 2px 0; line-height: 1.5; }
 .stage-caption i { font-style: normal; margin: 0 8px; }
+.recording-link { color: var(--accent); margin-left: 8px; text-decoration: none; }
+.recording-link:hover { text-decoration: underline; }
 .control-panel { min-width: 0; border-left: 1px solid var(--line); background: #101510; padding: 20px 24px; }
 .panel-section + .panel-section { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); }
 .section-heading { display: flex; align-items: center; gap: 9px; margin-bottom: 14px; }
