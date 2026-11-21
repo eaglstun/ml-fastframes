@@ -134,6 +134,24 @@ class DemoTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.app.waiting_room.owner, "a")
         self.assertEqual(self.pool.calls[:4], ["start", "step", "stop", "start"])
 
+    async def test_previews_reach_the_browser_before_their_frames(self):
+        call = self.pool.call
+
+        def with_previews(op, on_preview=None, **kwargs):
+            if op == "step" and on_preview is not None:
+                for index in (1, 2):
+                    on_preview({"jpeg": image_bytes(), "pass": index, "passes": 4, "chunk_index": self.pool.chunk})
+            return call(op, **kwargs)
+        self.pool.call = with_previews
+        await self.start()
+        await eventually(lambda: any(not isinstance(m, dict) for m in self.a.messages))
+        kinds = [m.get("type") if isinstance(m, dict) else "frames" for m in self.a.messages]
+        kinds = [k for k in kinds if k in ("preview", "chunk", "frames")]
+        self.assertEqual(kinds, ["preview", "preview", "chunk", "frames"])
+        previews = [m for m in self.a.messages if isinstance(m, dict) and m.get("type") == "preview"]
+        self.assertEqual([m["pass"] for m in previews], [1, 2])
+        self.assertTrue(previews[0]["image"].startswith("data:image/jpeg;base64,"))
+
     async def test_tilt_is_rejected(self):
         await self.start()
         for action in ("pitch_up", "pitch_down", {}, None):

@@ -54,6 +54,9 @@ def _worker(rank, config, commands, replies, rendezvous):
         # MPS/CPU: reply with the frames before the chunk's KV-cache write, then write it and encode
         # the next chunk's VAE condition between turns (LINGBOT_DEMO_PREFETCH=0 disables both)
         prefetch = not cuda and os.environ.get("LINGBOT_DEMO_PREFETCH", "1") != "0"
+        # MPS/CPU: send a rough still of the chunk after the first two of its four denoising passes
+        # (~30% and ~60% of the turn) while it finishes (LINGBOT_DEMO_PREVIEW=0 disables)
+        previews = not cuda and world == 1 and os.environ.get("LINGBOT_DEMO_PREVIEW", "1") != "0"
         while True:
             request = commands.get()  # No GPU collective is pending during user idle.
             op = request["op"]
@@ -96,7 +99,16 @@ def _worker(rank, config, commands, replies, rendezvous):
                     raise ValueError(f"Unknown camera action: {action}")
                 synchronize(device)
                 start = time.perf_counter()
-                frames = pipe.step(camera.rays(keys.chunk(action)), defer_cache=prefetch)
+                def send_preview(index, frames):
+                    frame = frames[frames.shape[0] // 2].cpu().numpy()
+                    buffer = io.BytesIO()
+                    Image.fromarray(frame).save(buffer, format="JPEG", quality=85)
+                    replies.put({"rank": rank, "preview": {"jpeg": buffer.getvalue(), "pass": index + 1,
+                                                           "passes": len(pipe.timesteps),
+                                                           "chunk_index": pipe.chunk}})
+
+                frames = pipe.step(camera.rays(keys.chunk(action)), defer_cache=prefetch,
+                                   preview=send_preview if previews else None)
                 synchronize(device)
                 model_ms = (time.perf_counter() - start) * 1000
                 if world > 1:
@@ -171,7 +183,8 @@ class WorkerPool:
             self.commands.append(commands)
             self.processes.append(process)
 
-    def call(self, op, **payload):
+    def call(self, op, *, on_preview=None, **payload):
+        """Run ``op`` on every rank; ``on_preview(preview)`` (this thread) gets rank 0's step previews."""
         if not self.processes:
             if op == "stop":
                 return {}
@@ -193,6 +206,10 @@ class WorkerPool:
                     continue
                 if "error" in response:
                     raise RuntimeError(response["error"])
+                if "preview" in response:
+                    if on_preview is not None:
+                        on_preview(response["preview"])
+                    continue
                 responses[response["rank"]] = response
         except BaseException:
             self.close(force=True)

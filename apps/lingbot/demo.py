@@ -133,10 +133,11 @@ class DemoApplication:
     async def _error(self, websocket, message, *, code="invalid_request"):
         await self._send(websocket, {"type": "error", "code": code, "message": message})
 
-    async def _call(self, op, **payload):
+    async def _call(self, op, on_preview=None, **payload):
         # A CUDA call is not cancellable. Always drain it before resetting state
         # or admitting the next player, including disconnected cold starts.
-        future = asyncio.get_running_loop().run_in_executor(self.executor, lambda: self.pool.call(op, **payload))
+        future = asyncio.get_running_loop().run_in_executor(
+            self.executor, lambda: self.pool.call(op, on_preview=on_preview, **payload))
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
@@ -230,7 +231,15 @@ class DemoApplication:
                 action, request_id, queued_at = command
                 await self._send(websocket, {"type": "status", "state": "generating", "message": "Generating…"})
                 queue_ms = (time.monotonic() - queued_at) * 1000
-                batch = await self._call("step", action=action)
+                loop, sends = asyncio.get_running_loop(), []
+
+                def on_preview(preview, request_id=request_id):  # executor thread
+                    sends.append(asyncio.run_coroutine_threadsafe(
+                        self._send_preview(websocket, active, request_id, preview), loop))
+
+                batch = await self._call("step", action=action, on_preview=on_preview)
+                # Previews go out before their chunk's frames
+                await asyncio.gather(*(asyncio.wrap_future(send) for send in sends))
                 frames = batch.pop("frames")
                 active.chunk = batch["chunk_index"]
                 active.terminal = batch["terminal"]
@@ -265,6 +274,17 @@ class DemoApplication:
             # Schedule cleanup outside this task; cleanup may cancel and await it.
             if not active.stopping:
                 asyncio.create_task(self.waiting_room.session_released(active.owner_id))
+
+    async def _send_preview(self, websocket, active, request_id, preview):
+        if active.stopping or self.active is not active:
+            return
+        image = "data:image/jpeg;base64," + base64.b64encode(preview["jpeg"]).decode()
+        try:
+            await self._send(websocket, {"type": "preview", "request_id": request_id,
+                                         "chunk_index": preview["chunk_index"], "pass": preview["pass"],
+                                         "passes": preview["passes"], "image": image})
+        except ConnectionClosed:
+            pass
 
     async def _stop_session(self, connection_id, notify=None):
         active = self.active

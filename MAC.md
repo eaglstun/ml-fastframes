@@ -250,6 +250,15 @@ is an A/B measured back to back or interleaved, not an absolute benchmark.
   only the next chunk reads. The demo worker replies with the frames first and writes the cache
   between turns, with the prefetch: 0.7 s per full-cache chunk off each turn (2.4 s on the first),
   bit-identical frames. Same switch as the prefetch.
+- **Rough previews while a chunk generates** (`step(..., preview=callback)`). The pixel decoder
+  turns the DiT features of the first and second of the four denoising passes into a hazy but
+  recognizable version of the chunk (20-21 dB and 22-23 dB PSNR against the final frames, against
+  11-18 dB for holding the previous frame). The demo shows the middle frame as a still, marked
+  `PREVIEW 1/4` / `2/4`, until the chunk's frames arrive: about 5 s and 9.5 s into a ~20 s
+  full-cache turn, 3.5 s and 6.3 s into an early one. The decoder's history is restored after each
+  preview, so the frames are byte-identical with previews off (141/141 demo frames). Each preview
+  costs one pixel decode (~0.25 s), below the run-to-run noise of a turn. `LINGBOT_DEMO_PREVIEW=0`
+  disables them (MPS/CPU, one device).
 
 What's left in a full-cache LingBot chunk is mostly attention (~60%) and GEMMs, which run at
 12.4-14.2 TFLOPS (MPS's own matmul), close to what this GPU does.

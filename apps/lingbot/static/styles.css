@@ -74,6 +74,7 @@ button, a, input, textarea, select, summary, [tabindex] { -webkit-tap-highlight-
 .stage-hud-bottom { bottom: 28px; }
 .take-indicator { display: flex; align-items: center; gap: 7px; font: 9px var(--mono); letter-spacing: 1px; }
 .hud-chip { color: #d6dfce; font: 9px var(--mono); }
+.preview-chip { color: var(--accent); margin-left: auto; margin-right: 14px; }
 .action-readout, .frame-readout { display: flex; flex-direction: column; gap: 5px; }
 .stage-hud small { font: 8px var(--mono); letter-spacing: 1px; color: #b1bfa4; }
 .action-readout strong { font-size: 12px; font-weight: 500; }

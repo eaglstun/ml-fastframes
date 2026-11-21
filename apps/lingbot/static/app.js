@@ -73,7 +73,21 @@
     state.requestTimes.clear();
     state.cancelLoad?.();
     state.cancelLoad = null;
+    $("previewLabel").hidden = true;
     clearHeld();
+  }
+
+  function showPreview(message) {
+    // A rough still of the chunk being generated; the chunk's real frames replace it.
+    if (!state.active || state.stopping || state.awaitingStart || state.playing || !state.waiting) return;
+    if (typeof message.image !== "string" || !message.image.startsWith("data:image/jpeg;base64,")) return;
+    const frame = $("worldFrame");
+    frame.src = message.image;
+    frame.hidden = false;
+    $("stagePlaceholder").hidden = true;
+    $("previewLabel").textContent = `PREVIEW ${message.pass}/${message.passes}`;
+    $("previewLabel").hidden = false;
+    status(`Generating · rough preview ${message.pass} of ${message.passes}`);
   }
 
   function resetTiming() {
@@ -241,6 +255,7 @@
     const epoch = state.epoch;
     state.preparing = false;
     state.playing = true;
+    $("previewLabel").hidden = true;
     if (metadata.request_id === null) $("actionReadout").textContent = "Hold pose";
     updateControls();
     if (metadata.width && metadata.height) $("resolutionLabel").textContent = `${metadata.width} × ${metadata.height}`;
@@ -365,6 +380,7 @@
           break;
         case "status": handleStatus(message); break;
         case "chunk": state.metadata.push(message); break;
+        case "preview": showPreview(message); break;
         case "error":
           error(message.message || "The server could not complete the request.");
           cancelPlayback();

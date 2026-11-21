@@ -213,7 +213,7 @@ class FastFramesLingBot:
                         layer[:, start:end].copy_(layer[:, start + shift:end + shift])
 
     @torch.inference_mode()
-    def step(self, rays, *, defer_cache=False):
+    def step(self, rays, *, defer_cache=False, preview=None, preview_passes=(0, 1)):
         """Generate the next chunk for camera ``rays`` (``Trajectory.rays`` / ``LiveCamera.rays``).
 
         Returns ``[16, 464, 832, 3]`` uint8 frames on rank 0 (13 for the first chunk: the pixel
@@ -223,7 +223,14 @@ class FastFramesLingBot:
         clean pass), which only the next chunk reads. ``defer_cache=True`` returns the frames
         before it; an interactive caller then runs ``finish_chunk()`` while the frames are shown
         (the next ``step`` runs it first if the caller didn't). Same values either way.
+
+        ``preview(index, frames)`` (rank 0, one GPU) receives the pixel decoding of the denoising
+        passes in ``preview_passes`` (0-based, before the last): rough frames of this chunk
+        available well before it's done. The decoder's history is restored afterwards, so the
+        final frames are unchanged.
         """
+        if preview is not None and self.world != 1:
+            raise ValueError("previews need a single device")
         self.finish_chunk()
         chunk = self.chunk
         if self.condition is None or chunk >= self.num_chunks:
@@ -238,7 +245,10 @@ class FastFramesLingBot:
         else:
             x = torch.randn((16, CHUNK, LATENT_HEIGHT, LATENT_WIDTH), device=self.device, generator=self.generator)
         for i, timestep in enumerate(self.timesteps):
-            result = self.dit(x, timestep, read_frames)
+            previewed = preview is not None and i in preview_passes and i + 1 < len(self.timesteps)
+            result = self.dit(x, timestep, read_frames, capture=True if previewed else None)
+            if previewed:
+                preview(i, self._preview_frames(result, chunk))
             x0 = (x.to(self.f64).double() - self.sigmas[i] * result.prediction.to(self.f64).double()).float()
             x0 = x0.to(self.device)
             if i + 1 < len(self.timesteps):
@@ -253,6 +263,15 @@ class FastFramesLingBot:
         frames = None if self.rank != 0 else to_uint8(pixels[0, 3:] if chunk == 0 else pixels[0])
         if not defer_cache:
             release_mps_cache(self.device)  # MPS: don't let the allocator hoard per-chunk temporaries
+        return frames
+
+    def _preview_frames(self, result, chunk):
+        history = self.decoder.runtime.history
+        saved = [h.clone() for h in history]
+        pixels = self.decoder(result.features, result.embedding)
+        frames = to_uint8(pixels[0, 3:] if chunk == 0 else pixels[0])
+        for h, value in zip(history, saved):
+            h.copy_(value)
         return frames
 
     @torch.inference_mode()
