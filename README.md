@@ -7,13 +7,14 @@
 
 > **This fork adds Apple Silicon (MPS) support for FastFrames-S text-to-video and the LingBot
 > camera-control demo.** On an M4 Max, T2V takes ~45-50 s per 81-frame 480p video with ~18 GB peak
-> memory, and the LingBot demo makes each 1 s turn in ~12-24 s. See
+> memory. The LingBot demo makes each 1 s turn in ~12-25 s at 832x464 with a rough preview after
+> ~4-6 s, or in ~5-6 s with a preview in under 2 s at `--size 576x320` (lower fidelity). See
 > [Apple Silicon](#apple-silicon-mps) and [MAC.md](MAC.md). Everything else is upstream
 > [apple-aiml-research/ml-fastframes](https://github.com/apple-aiml-research/ml-fastframes) and
 > still targets Linux + NVIDIA.
 
-This repository contains the official implementation of *FastFrames: Video Generation at
-Interactive Latency*. We release [FastFrames-S](https://huggingface.co/apple/FastFrames-S)
+This repository contains the official implementation of _FastFrames: Video Generation at
+Interactive Latency_. We release [FastFrames-S](https://huggingface.co/apple/FastFrames-S)
 (1.3B) and [FastFrames-L](https://huggingface.co/apple/FastFrames-L) (14B). Both are
 autoregressive, two-step video diffusion models that generate 480p video at interactive
 latency. We also release an optimized version of LingBot 1.3B that is 16x faster than the
@@ -57,19 +58,21 @@ $HF download Wan-AI/Wan2.1-T2V-1.3B --exclude 'diffusion_pytorch_model*' --local
     --prompt "A corgi surfing a wave at sunset" --seed 0 --output outputs/corgi.mp4
 ```
 
-| M4 Max, 64 GB             |                               |
-| ------------------------- | ----------------------------- |
-| model load                | ~5 s                          |
+| M4 Max, 64 GB             |                                    |
+| ------------------------- | ---------------------------------- |
+| model load                | ~5 s                               |
 | rollout, 21 latent frames | ~45-50 s (~2.2 s per latent frame) |
-| peak memory               | ~18 GB                        |
+| peak memory               | ~18 GB                             |
 
 This is batch generation, not interactive latency: the rollout is compute-bound, about 100×
 below the B200 numbers above.
 
 The [LingBot interactive demo](#interactive-demo-with-lingbot) also runs on a Mac (single device,
 eager): `.venv/bin/python apps/lingbot/demo.py --gpus 1 --lingbot-root upstream/lingbot-world-v2`.
-Once warm, each 1 s turn (16 frames) takes ~12-24 s on the M4 Max, so you explore shot by shot.
-Setup, measurements and the changes are in
+On the M4 Max each 1 s turn (16 frames) takes ~12-25 s at the trained 832x464, so you explore shot
+by shot, and the page shows a rough preview of the chunk ~4-6 s in. Add `--size 576x320` for
+~5-6 s turns with a preview in under 2 s: close to interactive, with softer frames, because the
+model was trained at 832x464. Setup, measurements and the changes are in
 [MAC.md](MAC.md#lingbot-camera-control-interactive-demo).
 
 The single-device [latency benchmarks](MAC.md#latency-benchmarks) run too: one FastFrames-S step
@@ -88,13 +91,13 @@ uv run python evaluation/latency/benchmark.py ff-l --gpus 8
 
 Example component timings for **FastFrames-S, 1 GPU, 480p**, with a full KV cache.
 
-| Component | Calls | Latency per call | Total latency |
-|---|---:|---:|---:|
-| DiT evaluation, t=1000 | 1 | 16.1 ms | 16.1 ms |
-| DiT evaluation, t=833 | 1 | 16.2 ms | 16.2 ms |
-| KV refinement | 1 | 2.2 ms | 2.2 ms |
-| Pixel decoder | 1 | 0.9 ms | 0.9 ms |
-| **Total** | | | **35.4 ms** (paper: 36 ms) |
+| Component              | Calls | Latency per call |              Total latency |
+| ---------------------- | ----: | ---------------: | -------------------------: |
+| DiT evaluation, t=1000 |     1 |          16.1 ms |                    16.1 ms |
+| DiT evaluation, t=833  |     1 |          16.2 ms |                    16.2 ms |
+| KV refinement          |     1 |           2.2 ms |                     2.2 ms |
+| Pixel decoder          |     1 |           0.9 ms |                     0.9 ms |
+| **Total**              |       |                  | **35.4 ms** (paper: 36 ms) |
 
 See the [profiling guide](docs/inference.md#profiling) for details and baselines.
 
