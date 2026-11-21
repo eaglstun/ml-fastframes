@@ -362,27 +362,34 @@ if transfers overlap compute. At 576x320 the gain shrinks to ~1.2-1.5x and at 41
 it needs the block in MLX-Swift (`lingbot_block_mlx.py` is the reference), a K/V exchange per layer,
 and the refined cache sent to the iPad between turns.
 
-**Built and measured: one pass split by tokens** (`scripts/lingbot_ipad_split.py` here,
-`SplitStage.swift` in exo-ipad-spike). The script runs the pipeline to a full cache and takes the
-first pass of chunk 5 three ways: the Mac alone through the pipeline's own block; its own split
-block with every token on the Mac, which matches the pipeline bit for bit (a check of the
-reimplementation); and split with the iPad, interleaved with Mac-alone passes because background
-GPU work moves the Mac's timings. Per block both sides send their tokens' K/V (bf16 over the USB
-link) and attend over the full cache; setup sends the weights, caches, text K/V and camera rows once
-(8.1 GB in 11 s).
+**Built: the iPad shares LingBot's DiT** (`apps/lingbot/ipad.py` here, `SplitStage.swift` in
+exo-ipad-spike, `demo.py --ipad <its USB address>`). Every denoising pass's chunk tokens are split;
+in each block both sides swap their tokens' canonical (pre-RoPE) keys and values, rotate the other's,
+and attend over the whole cache, so this Mac also holds every token's canonical K/V for the KV
+refiner. The iPad mirrors the cache: the weights once (2.6 GB in ~3.7 s, footprint 8.2 GB), the
+prompt's text K/V, resets, eviction, each chunk's RoPE table and camera tokens (it computes its own
+camera rows), and the refined rows after each chunk (1.1 GB, sent in `finish_chunk`, i.e. between
+turns in the demo). The split moves every chunk towards where both sides finish a pass together.
 
-| one pass, 832x464, full cache | time |
+One pass on its own (`lingbot_ipad_split.py`'s first version): 4.53 s alone vs 3.10-3.25 s split
+(~1.4x), 4.9e-3 relative L2 against the Mac alone; its own split block with every token on the
+Mac matches the pipeline's bit for bit. A whole world (`scripts/lingbot_ipad_split.py`: Mac alone,
+split, Mac alone again; the two Mac-alone runs are bit-identical):
+
+| 10-chunk world, 832x464 | full-cache chunk (median, chunks 5-9) |
 |---|---|
-| M4 Max alone, quiet | 4.53 s |
-| split, 48% / 55% / 60% of the tokens on the iPad | 3.21-3.25 / 3.14-3.18 / 3.10-3.16 s (~1.4x) |
-| M4 Max alone while Photos analyses media | ~7.8 s |
-| split, same moment (55%) | ~3.7 s (~2.1x) |
+| Mac alone (both runs, Photos analysing media part of the time) | 27.3 s |
+| split with the iPad, rebalanced every chunk (its share 38-55%) | 21.6 s (1.26x) |
 
-The split pass matches the Mac alone to 4.9e-3 relative L2 after 30 blocks (each block alone:
-1.2e-3); whether that is visible over many chunks is for frames to show. At 48% the iPad waited
-0.72 s per pass for the Mac's K/V, at 60% not at all: then the iPad sets the pace. Not done yet:
-the per-chunk work around the passes (the iPad's camera rows, the refined cache rows after each
-chunk, eviction), overlapping the K/V transfer with attention over the cached rows, and the demo.
+The split frames show the same scene and stay clean; their details drift from the Mac's as an
+autoregressive model's do from any small difference (PSNR 43 dB at chunk 0, ~20 dB by chunk 9). In
+the browser demo full-size turns took 10.7 / 12.0 s of model time against 11.6-12.2 / 15.6 s
+alone; at 576x320 and 416x240 the exchange costs more than the iPad saves (4.6 vs 4.4 s, 3.4 vs
+2.6 s), so the demo shares only 832x464 unless `--ipad-all-sizes`. The iPad stayed thermally
+nominal; what's left is the exchange itself: both sides wait 1-1.4 s per pass for the other's K/V
+(12 MB per block each way over the 858 MB/s link, plus copies). Hiding it means attending over the
+cached rows while the other side's are in flight and merging with a log-sum-exp, which neither the
+Metal flash kernel here nor MLX's attention returns yet.
 
 ## What was changed for FastFrames-S (see `git diff`)
 

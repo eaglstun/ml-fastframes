@@ -532,7 +532,7 @@ function handleMessage(message) {
     switch (message.type) {
         case "hello":
             state.ready = Boolean(message.ready);
-            ui.gpuLabel.textContent = `${message.gpus} GPU${message.gpus === 1 ? "" : "s"}`;
+            ui.gpuLabel.textContent = `${message.gpus} GPU${message.gpus === 1 ? "" : "s"}${message.assist ? ` + ${message.assist}` : ""}`;
             renderSizes(message.sizes);
             status(state.ready ? "Ready · set the scene and start your world" : "Ready · first start warms up the model");
             updateControls();

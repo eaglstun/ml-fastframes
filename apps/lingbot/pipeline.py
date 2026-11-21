@@ -134,6 +134,7 @@ class FastFramesLingBot:
         self.decoder = decoder_cls(decoder, compile=compile, graphs=graphs)
         self.prompt = self.condition = self.noise = self.generator = None
         self._pending = None  # deferred cache write of the last chunk (``step(..., defer_cache=True)``)
+        self.assist = None  # an ipad.IPadAssist sharing the DiT's tokens with another device, if attached
         self.noise_mode = "clip"
         self.latents = self.chunk = 0
 
@@ -188,6 +189,8 @@ class FastFramesLingBot:
         self._pending = None
         self.cache_k.zero_()
         self.cache_v.zero_()
+        if self.assist is not None:
+            self.assist.reset()
         self.decoder.reset()
         self.generator = torch.Generator(device=self.device).manual_seed(int(seed))
         self.noise = None
@@ -220,6 +223,8 @@ class FastFramesLingBot:
                     for start in range(sink, sink + rolled, shift):
                         end = min(start + shift, sink + rolled)
                         layer[:, start:end].copy_(layer[:, start + shift:end + shift])
+            if self.assist is not None:
+                self.assist.evict(sink, shift, rolled)
 
     @torch.inference_mode()
     def step(self, rays, *, defer_cache=False, preview=None, preview_passes=(0, 1)):
@@ -297,6 +302,8 @@ class FastFramesLingBot:
             self.dit(x0, 0, read_frames, capture=False)  # clean pass writes the first chunk's cache
         else:
             self.refiner(x0, y, rope, read_frames)
+            if self.assist is not None:  # the refiner ran here: send its rows to the other device
+                self.assist.sync_rows(read_frames)
 
     def parts(self):
         """Constructor arguments sharing this pipeline's weights: after ``close()`` and
@@ -305,6 +312,9 @@ class FastFramesLingBot:
 
     def close(self):
         """Release CUDA graphs (call on every rank before destroying the process group)."""
+        if self.assist is not None:
+            self.assist.close()
+            self.assist = None
         self.refiner.close()
         self.decoder.close()
         self.dit.close()

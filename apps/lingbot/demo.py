@@ -193,7 +193,7 @@ class DemoApplication:
             config = self.pool.config
             sizes = [list(size) for size in config.get("sizes") or [config.get("size", DEFAULT_SIZE)]]
             await self._send(websocket, {"type": "hello", "gpus": config["gpus"], "ready": self.pool.ready,
-                                         "sizes": sizes})
+                                         "sizes": sizes, "assist": "iPad" if config.get("ipad") else None})
             await self._send(websocket, room.state(connection_id))
             async for raw in websocket:
                 try:
@@ -490,6 +490,13 @@ def main():
     parser.add_argument("--save-dir", default="outputs/lingbot_demo", metavar="DIR",
                         help="save every session's video (MP4 + start image + JSON) here when it ends; "
                              "'' disables (default: outputs/lingbot_demo)")
+    parser.add_argument("--ipad", metavar="HOST", help="share each DiT pass with an iPad running SplitStage "
+                        "(exo-ipad-spike, SPIKE_MODE=split) at HOST, e.g. its USB link address 169.254.x.y")
+    parser.add_argument("--ipad-port", type=int, default=5570)
+    parser.add_argument("--ipad-share", type=float, default=0.55,
+                        help="the iPad's starting fraction of each pass's tokens (rebalanced every chunk)")
+    parser.add_argument("--ipad-all-sizes", action="store_true",
+                        help="share smaller frame sizes too (by default only 832x464, where it pays off)")
     parser.add_argument("--size", type=parse_size, default=DEFAULT_SIZE, metavar="WxH",
                         help="frame size (default 832x464, the trained size). Smaller is much faster and out "
                              "of distribution: 576x320 is ~4x faster per chunk and softer; 416x240 melts")
@@ -497,6 +504,8 @@ def main():
     if args.size != DEFAULT_SIZE and args.gpus != 1:
         parser.error("--size other than 832x464 was only tried on one device")
     args.sizes = session_sizes(args.size, args.gpus)  # offered to visitors; --size is the default
+    if args.ipad and args.gpus != 1:
+        parser.error("--ipad shares a single device's DiT")
     if not args.lingbot_root or not Path(args.lingbot_root, "wan", "modules", "model_fast.py").is_file():
         parser.error("set LINGBOT_WORLD_ROOT or --lingbot-root to the pinned upstream clone "
                      "(see docs/lingbot.md)")
