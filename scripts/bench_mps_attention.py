@@ -52,6 +52,7 @@ def main():
     ap.add_argument("--reps", type=int, default=5)
     args = ap.parse_args()
     tiling = tuple(int(x) for x in args.tiling.split(",")) if args.tiling else None
+    torch.mps.set_per_process_memory_fraction(0.6)  # never let a benchmark push the Mac into swap
     assert mfa.is_available(D), "kernel unavailable"
     flash = lambda q, k, v: mfa.flash_attention(q, k, v, tiling=tiling)  # noqa: E731
 

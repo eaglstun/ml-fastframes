@@ -45,13 +45,24 @@ switches back to PyTorch SDPA (one head per call); `flash` is the default.
 
 - FlashAttention-style: each SIMD-group owns 16 query rows and walks the keys 24 at a time with an
   online softmax, so the `[Lq, Lk]` score matrix is never materialised. `Q K^T` and `P V` use the
-  GPU's 8x8 `simdgroup_matrix` multiply-accumulate in FP32 (BF16 in, BF16 out).
+  GPU's 8x8 `simdgroup_matrix` multiply-accumulate with BF16 operand tiles and FP32 accumulators
+  (BF16 in, BF16 out; the mixed form is bit-identical to widening the operands first).
+- Operand tiles are loaded three steps before the multiply that uses them (software pipelining,
+  `_LOOKAHEAD`). A load placed right before its use stalls the SIMD-group for the load latency:
+  hoisting the loads took the kernel from 10.6 to 12.5 TFLOPS with bit-identical output. The softmax
+  is base 2 (`log2(e)` folded into the scale, `exp2`), worth another ~2%.
 - Shapes are runtime arguments: one pipeline serves every KV length (and the L=512 text
   cross-attention), so nothing is cached per shape. It reads and writes the model's `[B, L, H, D]`
   layout directly, so there are no transpose copies.
 - The kernel source is generated as straight-line code (every 8x8 tile a named variable, every
   offset a literal). The same algorithm written with arrays of matrices in loops was 2-4x slower.
   16 query rows per SIMD-group is the limit: 24 or 32 fall out of registers and run ~1.6x slower.
+  8 rows multiply faster but double the SIMD-groups streaming K/V and end up memory-bound (7 TFLOPS).
+- Tried without success: staging K/V tiles in threadgroup memory for 8 SIMD-groups (the copy and
+  the two barriers per step cost what the sharing saves), `simdgroup_load` (1.4x slower than typed
+  per-thread loads), Q held in registers, permuting dims so one 8-byte load feeds two tiles,
+  rescaling the running output only when a row maximum changes, larger key blocks. Putting heads
+  on the fast dispatch axis is +2% at 1,560 query rows but -10% at 6,032, so it stays as is.
 - It relies on the lane-to-element layout of `simdgroup_matrix` (the trick MLX's steel kernels
   use), which the MSL spec doesn't guarantee. The layout is probed at first use and `attention()`
   falls back to SDPA if it doesn't hold. Credits are in the file header.
@@ -63,11 +74,12 @@ synchronized, median):
 |---|---|---|
 | 512 (cross-attention) | 1.1 ms | 1.8 ms |
 | 1,560 | 1.5 ms | 3.0 ms |
-| 15,600 | 14.0 ms | 28.5 ms |
-| 32,760 | 29.8 ms | 64.2 ms |
-| sum over the 21 KV lengths | **326 ms** | 673 ms |
+| 15,600 | 11.8 ms | 28.5 ms |
+| 32,760 | 24.9 ms | 64.2 ms |
+| sum over the 21 KV lengths | **275 ms** | 673 ms |
 
-That is ~10.6 TFLOPS for the whole attention, against ~5 for SDPA and 13-14.7 for a bare MPS GEMM.
+That is ~12.6 TFLOPS for the whole attention (13.0 at LingBot's 6,032 x 27,144), against ~5 for SDPA
+and 13-14.7 for a bare MPS GEMM; a loop of nothing but register-to-register 8x8 multiplies reaches ~14.
 Driver memory stays flat across all 22 shapes (1.03 GB in the benchmark, which is the test tensors).
 Against an FP32 CPU reference the kernel is closer than MPS SDPA, because it accumulates in FP32:
 on tensors captured from the rollout at 32,760 keys, max/mean abs error 7.8e-3 / 6.7e-4 (output
@@ -168,8 +180,8 @@ cool-down, t=833 takes 1341 ms (then t=1000, 2 minutes later, 1406 ms). On a coo
 only ~1%.
 
 For comparison, the Wan VAE decode that the baselines use instead of the pixel decoder takes
-5.4 s per latent frame here (shorter run: two streamed passes, measured while Photos analysis
-was still busy), ~94x the pixel decoder.
+1.5 s per latent frame here with the conv2d path below (4.9 s with PyTorch's MPS `conv3d`; two
+streamed passes each, back to back), ~26x the pixel decoder.
 
 LingBot 1.3B, one chunk (16 frames, 1 s of video) with a full 18-frame cache: **25.9 s** median
 (16 chunks, range 25.3-26.4 s) against 220.7 ms on a B200. The run uses 16-chunk videos
@@ -202,6 +214,40 @@ per LingBot chunk: background GPU work inflates these by up to ~30%.
 
 Not ported: the multi-GPU rows (`--gpus 8`, NVLink symmetric memory), the 720p/14B rows, and the
 Causal Forcing++ / Self-Forcing baseline DiTs (`baselines.py`, needs their upstream clones).
+
+## Performance work: VAE convolutions, attention pipelining, condition prefetch
+
+Profiling a full-cache LingBot chunk and a FastFrames-S DiT step on the M4 Max found three wins.
+Background GPU work (Photos analysis) was running during most of these runs, so each number below
+is an A/B measured back to back or interleaved, not an absolute benchmark.
+
+- **Wan VAE 3D convolutions as per-tap `conv2d`** (`fastframes/wan/mps_conv3d.py`). MPS `conv3d`
+  runs the VAE's 3x3x3 layers at ~3.3 TFLOPS in every dtype; the same convolution written as the
+  sum over its temporal taps of batched `conv2d` calls runs at 13-16 TFLOPS in FP32 (same values to
+  ~1e-6 relative L2). Only `_conv_forward` of the Wan `CausalConv3d` classes is replaced (ours, and
+  the LingBot clone's at import), so causal padding and feature caches are unchanged.
+  `FASTFRAMES_MPS_CONV3D=native` restores `conv3d`.
+  - LingBot image condition: 3.19 s -> 0.95 s per black-frame latent, 4 latents per chunk. With
+    the kernel change below, a new world's first demo session went from 24.2 / 26.3 / 29.3 / 31.2 s
+    to 14.2 / 17.0 / 20.4 / 21.7 s for turns 1-4 (no prefetch).
+  - Wan VAE decode (baseline rows): 4.9 s -> 1.5 s per latent frame.
+  - Found on the way: MPS `conv2d` silently returns wrong results for a non-contiguous weight view
+    such as `weight[:, :, k]` (PyTorch 2.9.1). The per-tap weights are made contiguous once.
+- **Software-pipelined loads in the flash-attention kernel** (by Fable; details in the kernel
+  section above): 10.6 -> 12.7 TFLOPS at 1,560 x 32,760 and 11.8 -> 13.0 at LingBot's 6,032 x 27,144,
+  same error. Attention is ~70% of a FastFrames-S DiT step: one DiT evaluation went from 1294 to
+  1147 ms in a quiet run (-11%) and by 6% on average in four back-to-back pairs under load
+  (1325/1286, 1353/1249, 1554/1441, 1584/1478 ms). `latency.py`'s
+  LingBot chunk went from 25.9 s to 24.2 s (its timed chunks reuse a cached image condition, so it
+  doesn't see the VAE change).
+- **Condition prefetch in the demo** (`FastFramesLingBot.prefetch_condition`). The next chunk's VAE
+  condition doesn't depend on the camera action, so on MPS the demo worker encodes it right after
+  replying, while the player looks at the frames. Alternating full-cache chunks in one process:
+  26.3 s per step with the encode inline, 21.9 s prefetched. `LINGBOT_DEMO_PREFETCH=0` disables it.
+  The win shows when the player takes more than ~4 s between turns.
+
+What's left in a full-cache LingBot chunk is mostly attention (~60%) and GEMMs, which run at
+12.4-14.2 TFLOPS (MPS's own matmul), close to what this GPU does.
 
 ## What was changed for FastFrames-S (see `git diff`)
 

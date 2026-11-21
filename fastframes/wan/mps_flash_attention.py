@@ -10,10 +10,14 @@ native ``[B, L, H, D]`` layout directly, so there are no transpose copies either
 Design, per SIMD-group (32 threads = one threadgroup):
   * owns ``8*RT`` query rows and walks the keys in blocks of ``8*NK``;
   * ``S = Q K^T`` and ``O += P V`` run on the GPU's 8x8 ``simdgroup_matrix`` multiply-accumulate
-    units in FP32 (inputs are BF16, widened on load, so the dot products and the 32k-key
-    accumulation are done in FP32; only the final result is rounded to BF16);
+    units with BF16 operand tiles and FP32 accumulators (the mixed form widens exactly, so the dot
+    products and the 32k-key accumulation are done in FP32; only the final result is rounded to
+    BF16);
   * the softmax (scale, row max, exp, rescale of the running output) is done in registers on the
-    per-thread fragments of those matrices, so the scores never touch memory.
+    per-thread fragments of those matrices, so the scores never touch memory;
+  * operand tiles are loaded ``_LOOKAHEAD`` steps before the multiply that uses them (software
+    pipelining).  A load placed right before its use stalls the SIMD-group for the load latency;
+    this alone took the kernel from ~10.6 to ~12.5 TFLOPS on an M4 Max.
 
 Credits for the borrowed ideas:
   * MLX "steel" kernels (ml-explore/mlx, mlx/backend/metal/kernels/steel/, MIT): treating a
@@ -41,8 +45,10 @@ using namespace metal;
 #define H   %(H)d          // heads; tokens are H*D elements apart
 #define NEG (-1.0e30f)
 
-typedef simdgroup_float8x8 mat;
-#define FRAG(m) (reinterpret_cast<thread float2&>(m))
+typedef simdgroup_float8x8 mat;     // accumulators (scores, output)
+typedef simdgroup_bfloat8x8 bmat;   // operand tiles, as stored
+#define FRAG(m)  (reinterpret_cast<thread float2&>(m))
+#define BFRAG(m) (reinterpret_cast<thread bfloat2&>(m))
 
 // Lane -> element mapping of an 8x8 simdgroup matrix (2 elements per thread), as used by MLX steel:
 // row = 4*(lane>>4) + ((lane>>1)&3), cols = 4*((lane>>3)&1) + 2*(lane&1) + {0,1}.
@@ -66,7 +72,7 @@ kernel void flash_attn(device bfloat* out,
                        const device bfloat* v,
                        constant long& Lq_,
                        constant long& Lk_,
-                       constant float& scale,
+                       constant float& scale,   // includes log2(e): the softmax uses exp2
                        uint3 tg [[threadgroup_position_in_grid]],
                        ushort lane [[thread_index_in_simdgroup]]) {
     const uint Lq = uint(Lq_), Lk = uint(Lk_);
@@ -81,34 +87,58 @@ kernel void flash_attn(device bfloat* out,
 %(BODY)s}
 """
 
+def _emit(w, steps, lookahead):
+    """Write ``steps`` (pairs of load statements and the multiplies that consume them) with every
+    load issued ``lookahead`` steps before its multiplies."""
+    for loads, _ in steps[:lookahead]:
+        for x in loads:
+            w(x)
+    for n, (_, macs) in enumerate(steps):
+        if n + lookahead < len(steps):
+            for x in steps[n + lookahead][0]:
+                w(x)
+        for x in macs:
+            w(x)
+
+
 def _block(D, H, RT, NK, tail):
     """One online-softmax step over 8*NK keys starting at ``kb``.  ``tail`` adds index clamps and a
     key mask for the last, partial block; the fast path has only constant offsets."""
-    DT, ST = D // 8, H * D
+    DT, ST, LA = D // 8, H * D, _LOOKAHEAD
     R, J, DC = range(RT), range(NK), range(DT)
     Z = "make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"
     o = []
     w = o.append
-    # S = Q K^T, FP32 accumulate.  K^T tile element (row = dim, col = key): this thread reads dim fr
-    # of keys fc and fc+1.
+    # K^T tile element (row = dim, col = key): this thread reads dim fr of keys fc and fc+1.
+    # V tile element (row = key, col = dim): this thread reads dims fc, fc+1 of key fr.
     if tail:
         for j in J:
             w(f"const device bfloat* ka{j} = kh + ulong(min(kb + {j * 8} + fc, Lk - 1)) * {ST} + fr;")
             w(f"const device bfloat* kb{j} = kh + ulong(min(kb + {j * 8 + 1} + fc, Lk - 1)) * {ST} + fr;")
-        kload = lambda j, dc: f"float2(float(ka{j}[{dc * 8}]), float(kb{j}[{dc * 8}]))"  # noqa: E731
+            w(f"const device bfloat* v{j} = vh + ulong(min(kb + {j * 8} + fr, Lk - 1)) * {ST} + fc;")
+        kload = lambda j, dc: f"bfloat2(ka{j}[{dc * 8}], kb{j}[{dc * 8}])"  # noqa: E731
+        vload = lambda j, dc: f"bfloat2(v{j}[{dc * 8}], v{j}[{dc * 8 + 1}])"  # noqa: E731
     else:
         w(f"const device bfloat* kt = kh + ulong(kb + fc) * {ST} + fr;")
-        kload = lambda j, dc: f"float2(float(kt[{j * 8 * ST + dc * 8}]), float(kt[{(j * 8 + 1) * ST + dc * 8}]))"  # noqa: E731
-    w("mat A, " + ", ".join(f"B{j}" for j in J) + ";")
+        w(f"const device bfloat* vt = vh + ulong(kb + fr) * {ST} + fc;")
+        kload = lambda j, dc: f"bfloat2(kt[{j * 8 * ST + dc * 8}], kt[{(j * 8 + 1) * ST + dc * 8}])"  # noqa: E731
+        vload = lambda j, dc: f"bfloat2(vt[{j * 8 * ST + dc * 8}], vt[{j * 8 * ST + dc * 8 + 1}])"  # noqa: E731
+    # Enough operand registers that a tile loaded LA steps ahead never overwrites one still in use.
+    NA, NKS, NV = LA + 1, -(-LA // RT) + 1, LA + 1
+    w("bmat " + ", ".join([f"A{p}" for p in range(NA)] + [f"K{j}_{p}" for j in J for p in range(NKS)]
+                          + [f"V{j}_{p}" for j in J for p in range(NV)]) + ";")
     w("mat " + ", ".join(f"S{i}_{j} = {Z}" for i in R for j in J) + ";")
+    # S = Q K^T, FP32 accumulate.  One step per (dim tile, row tile).
+    steps = []
     for dc in DC:
-        for j in J:
-            w(f"FRAG(B{j}) = {kload(j, dc)};")
         for i in R:
-            w(f"FRAG(A) = float2(float(qt[{i * 8 * ST + dc * 8}]), float(qt[{i * 8 * ST + dc * 8 + 1}]));")
-            for j in J:
-                w(f"simdgroup_multiply_accumulate(S{i}_{j}, A, B{j}, S{i}_{j});")
-    # Online softmax on the per-thread fragments (the scores never touch memory).
+            pa, pk = (dc * RT + i) % NA, dc % NKS
+            loads = [f"BFRAG(K{j}_{pk}) = {kload(j, dc)};" for j in J] if i == 0 else []
+            loads.append(f"BFRAG(A{pa}) = bfloat2(qt[{i * 8 * ST + dc * 8}], qt[{i * 8 * ST + dc * 8 + 1}]);")
+            steps.append((loads, [f"simdgroup_multiply_accumulate(S{i}_{j}, A{pa}, K{j}_{pk}, S{i}_{j});" for j in J]))
+    _emit(w, steps, LA)
+    # Online softmax on the per-thread fragments (the scores never touch memory).  Base 2: log2(e)
+    # is folded into ``scale``, and exp2 is cheaper than exp.
     w("float mx, mn, alpha; float2 s;")
     for i in R:
         w("mx = NEG;")
@@ -120,25 +150,19 @@ def _block(D, H, RT, NK, tail):
             w(f"FRAG(S{i}_{j}) = s; mx = max(mx, max(s.x, s.y));")
         w("mx = max(mx, simd_shuffle_xor(mx, (ushort)1));")
         w("mx = max(mx, simd_shuffle_xor(mx, (ushort)8));")
-        w(f"mn = max(m{i}, mx); alpha = exp(m{i} - mn); m{i} = mn; l{i} *= alpha;")
+        w(f"mn = max(m{i}, mx); alpha = exp2(m{i} - mn); m{i} = mn; l{i} *= alpha;")
         for dc in DC:
             w(f"FRAG(O{i}_{dc}) *= alpha;")
         for j in J:
-            w(f"s = exp(FRAG(S{i}_{j}) - mn); l{i} += s.x + s.y; FRAG(S{i}_{j}) = s;")
-    # O += P V.  V tile element (row = key, col = dim): this thread reads dims fc, fc+1 of key fr.
-    if tail:
-        for j in J:
-            w(f"const device bfloat* v{j} = vh + ulong(min(kb + {j * 8} + fr, Lk - 1)) * {ST} + fc;")
-        vload = lambda j, dc: f"float2(float(v{j}[{dc * 8}]), float(v{j}[{dc * 8 + 1}]))"  # noqa: E731
-    else:
-        w(f"const device bfloat* vt = vh + ulong(kb + fr) * {ST} + fc;")
-        vload = lambda j, dc: f"float2(float(vt[{j * 8 * ST + dc * 8}]), float(vt[{j * 8 * ST + dc * 8 + 1}]))"  # noqa: E731
+            w(f"s = exp2(FRAG(S{i}_{j}) - mn); l{i} += s.x + s.y; FRAG(S{i}_{j}) = s;")
+    # O += P V.  One step per dim tile.
+    steps = []
     for dc in DC:
-        for j in J:
-            w(f"FRAG(B{j}) = {vload(j, dc)};")
-        for i in R:
-            for j in J:
-                w(f"simdgroup_multiply_accumulate(O{i}_{dc}, S{i}_{j}, B{j}, O{i}_{dc});")
+        pv = dc % NV
+        steps.append(([f"BFRAG(V{j}_{pv}) = {vload(j, dc)};" for j in J],
+                      [f"simdgroup_multiply_accumulate(O{i}_{dc}, S{i}_{j}, V{j}_{pv}, O{i}_{dc});"
+                       for i in R for j in J]))
+    _emit(w, steps, LA)
     return "".join(f"        {x}\n" for x in o)
 
 
@@ -154,7 +178,8 @@ def _body(D, H, RT, NK):
     w(f"    const device bfloat* qt = qh + ulong(r0) * {ST} + fc;")
     for i in range(RT):
         w(f"    float m{i} = NEG, l{i} = 0.0f;")
-        w("    mat " + ", ".join(f"O{i}_{dc} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f)" for dc in range(DT)) + ";")
+        w("    mat " + ", ".join(f"O{i}_{dc} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f)"
+                              for dc in range(DT)) + ";")
     w("    uint kb = 0;")
     w(f"    for (; kb + {8 * NK} <= Lk; kb += {8 * NK}) {{")
     w(_block(D, H, RT, NK, False) + "    }")
@@ -175,8 +200,13 @@ def _body(D, H, RT, NK):
 
 # (row tiles, key tiles): 16 query rows per SIMD-group, 24 keys per online-softmax step.  Measured on
 # an M4 Max: RT=2 is the most that stays in registers (RT>=3 is ~1.6x slower), NK=3 beats 1, 2, 4.
+# RT=1 has a higher multiply rate but twice the SIMD-groups streaming K/V, and is memory-bound.
 MIN_QUERY_ROWS = 16
 _DEFAULT_TILING = (2, 3)
+# Steps between loading an operand tile and multiplying with it.  0 (load at use) is ~17% slower;
+# 2..5 are within 2% of each other.
+_LOOKAHEAD = 3
+_LOG2E = 1.4426950408889634
 _libs = {}
 _mapping_ok = None
 
@@ -215,6 +245,7 @@ def flash_attention(q, k, v, scale=None, tiling=None):
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     out = torch.empty_like(q)
     groups = -(-lq // (8 * tiling[0]))
-    _lib(d, h, tiling).flash_attn(out, q, k, v, lq, lk, float(scale or 1.0 / math.sqrt(d)),
-                              threads=(32 * groups, b * h, 1), group_size=(32, 1, 1))
+    scale2 = float(scale or 1.0 / math.sqrt(d)) * _LOG2E  # the kernel's softmax is base 2
+    _lib(d, h, tiling).flash_attn(out, q, k, v, lq, lk, scale2,
+                                  threads=(32 * groups, b * h, 1), group_size=(32, 1, 1))
     return out

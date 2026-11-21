@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 
 from fastframes.device import default_device
+from fastframes.wan.mps_conv3d import patch_conv3d_class
 
 __all__ = ["UPSTREAM_URL", "UPSTREAM_COMMIT", "import_upstream", "Upstream", "load_upstream"]
 
@@ -61,9 +62,13 @@ def import_upstream(root=None):
     current_device = torch.cuda.current_device
     torch.cuda.current_device = lambda: "cpu"
     try:
-        return importlib.import_module("wan")
+        wan = importlib.import_module("wan")
     finally:
         torch.cuda.current_device = current_device
+    if torch.backends.mps.is_available():
+        # MPS conv3d is ~4x slower than per-tap conv2d; the VAE image condition is mostly 3x3x3 convs
+        patch_conv3d_class(importlib.import_module("wan.modules.vae2_1").CausalConv3d)
+    return wan
 
 
 @dataclass

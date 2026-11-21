@@ -188,6 +188,13 @@ class FastFramesLingBot:
                                      generator=self.generator)
         self.chunk = 0
 
+    @torch.inference_mode()
+    def prefetch_condition(self):
+        """Encode the next chunk's image condition now. It doesn't depend on the camera, so an
+        interactive caller can run this while it waits for the next action (``step`` then reuses it)."""
+        if self.condition is not None and self.chunk < self.num_chunks:
+            self.condition.chunk(self.chunk)
+
     def _evict(self, chunk):
         """Before writing ``chunk``: drop the oldest non-sink frames of a full cache (one shift per chunk)."""
         previous = min(CHUNK * chunk, CACHE_FRAMES)
