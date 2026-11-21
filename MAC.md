@@ -117,24 +117,28 @@ $HF download robbyant/lingbot-world-v2-14b-causal-fast \
     --example upstream/lingbot-world-v2/examples/00 --frames 29 --output outputs/lingbot.mp4
 ```
 
-Measured on the M4 Max with the demo server driven by a scripted websocket client (scene 00,
-idle GPU). Each turn is one chunk: 16 frames, 1 s of 16 fps video at 832x464.
+Measured on the M4 Max with the demo server driven by a scripted websocket client: scene 00,
+first session after server start, 5 s between turns, previews and prefetch on (the defaults).
+Each turn is one chunk: 16 frames, 1 s of 16 fps video. Times are from the key press.
 
-|                     | first session after server start | warm session (same server) |
-| ------------------- | -------------------------------- | -------------------------- |
-| world ready         | 16.0 s                           | 0.0 s (scene reused)       |
-| chunk 0 (13 frames) | 19.6 s                           | 12.5 s                     |
-| turn 1              | 24.2 s                           | 14.2 s                     |
-| turn 2              | 26.3 s                           | 18.1 s                     |
-| turn 3              | 29.3 s                           | 22.0 s                     |
-| turns 4-8           | 31.2-34.3 s                      | 23.5-24.0 s                |
+|                          | 832x464 (default)    | `--size 576x320`  |
+| ------------------------ | -------------------- | ----------------- |
+| world ready (cold start) | 18.6 s               | 10.7 s            |
+| chunk 0 (13 frames)      | 12.5 s               | 5.5 s             |
+| first preview, turns 1-8 | 3.5-6.5 s            | **1.4-1.9 s**     |
+| turns 1-3                | 11.7 / 15.0 / 17.3 s | 4.5 / 4.7 / 5.3 s |
+| turns 4-8                | 18.2-25.8 s          | **5.8-6.2 s**     |
 
-The first session pays one-time Metal shader compiles and allocations for new shapes. Turns
-get slower while the rolling KV cache fills (it holds 18 latent frames, full after about five
-chunks) and then hold at ~24 s, in line with `latency.py`'s 25.9 s per full-cache chunk. That's
-~12-24x slower than real time: you explore shot by shot rather than play. Peak memory went from
-83 GB (upstream conditioning) to 43 GB on a 2-chunk `generate.py` run; since the pipeline releases
-cached blocks after each chunk, `latency.py` holds a flat ~23 GB of driver memory.
+During a turn the demo shows a rough still of the chunk being generated (`PREVIEW 1/4`, then
+`2/4`), then plays the 16 frames. Turns get slower while the rolling KV cache fills (it holds 18
+latent frames, full after about five chunks). At 832x464 a turn is ~12-25x slower than real time,
+so you explore shot by shot; at 576x320 it's ~5-6x, close to interactive, at lower fidelity (see
+[Smaller frames](#smaller-frames-for-speed---size)). Before the performance work below, a first
+session took 24-34 s per turn at 832x464 with nothing on screen in between.
+
+Peak memory went from 83 GB (upstream conditioning) to 43 GB on a 2-chunk `generate.py` run; since
+the pipeline releases cached blocks after each chunk, `latency.py` holds a flat ~23 GB of driver
+memory (a 576x320 run peaks at ~13 GB).
 
 ### Smaller frames for speed (`--size`)
 
@@ -142,11 +146,11 @@ cached blocks after each chunk, `latency.py` holds a flat ~23 GB of driver memor
 832x464 is what LingBot and the FastFrames refiner/decoder were trained at, so smaller sizes trade
 fidelity for speed. Example 00, seed 0, same camera path, M4 Max:
 
-| size    | tokens/frame | full-cache chunk (`generate`-style, condition inline) | demo turn (5 s think time) | look                                                                                |
-| ------- | ------------ | ----------------------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------- |
-| 832x464 | 1508         | 30.9 s                                                | ~20-25 s                   | the model as trained                                                                |
-| 576x320 | 720          | 7.2 s                                                 | **4.6-5.9 s** (turns 1-8)  | softer detail, coherent; a different take on the scene; follows the camera less far |
-| 416x240 | 390          | 3.6 s                                                 | not measured               | melts within ~8 chunks (the horse smears) and stops following the camera            |
+| size    | tokens/frame | full-cache chunk (`generate`-style, condition inline) | demo turn (5 s think time)          | look                                                                                |
+| ------- | ------------ | ----------------------------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------- |
+| 832x464 | 1508         | 30.9 s                                                | 11.7-25.8 s, preview at 3.5-6.5 s   | the model as trained                                                                |
+| 576x320 | 720          | 7.2 s                                                 | **4.5-6.2 s**, preview at 1.4-1.9 s | softer detail, coherent; a different take on the scene; follows the camera less far |
+| 416x240 | 390          | 3.6 s                                                 | not measured                        | melts within ~8 chunks (the horse smears) and stops following the camera            |
 
 At 576x320 attention shrinks faster than the token count (both the chunk and the cache get
 smaller), so a chunk is 4.3x faster for 2.1x fewer tokens. A 125-frame `generate.py` video takes
@@ -156,6 +160,7 @@ downscaled one. `latency.py` records the size and `summarize.py` skips records n
 832x464.
 
 ```bash
+# ~5-6 s turns with a rough preview in under 2 s (previews and prefetch are on by default)
 .venv/bin/python apps/lingbot/demo.py --gpus 1 --lingbot-root upstream/lingbot-world-v2 --size 576x320
 ```
 
@@ -238,9 +243,10 @@ per LingBot chunk: background GPU work inflates these by up to ~30%.
 Not ported: the multi-GPU rows (`--gpus 8`, NVLink symmetric memory), the 720p/14B rows, and the
 Causal Forcing++ / Self-Forcing baseline DiTs (`baselines.py`, needs their upstream clones).
 
-## Performance work: VAE convolutions, attention pipelining, condition prefetch
+## Performance work: VAE convolutions, attention pipelining, demo prefetch and previews
 
-Profiling a full-cache LingBot chunk and a FastFrames-S DiT step on the M4 Max found three wins.
+Profiling a full-cache LingBot chunk and a FastFrames-S DiT step on the M4 Max found three wins;
+the last two items make demo turns feel faster without changing a frame.
 Background GPU work (Photos analysis) was running during most of these runs, so each number below
 is an A/B measured back to back or interleaved, not an absolute benchmark.
 

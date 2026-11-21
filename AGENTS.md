@@ -25,7 +25,7 @@ targets Linux + NVIDIA.
 
 ## Environment
 
-- **Mac:** use `.venv` built with `uv venv` + `uv pip install` (see the README's *Apple Silicon*
+- **Mac:** use `.venv` built with `uv venv` + `uv pip install` (see the README's _Apple Silicon_
   section). **Never run `uv sync` on a Mac**: `pyproject.toml` pins the `+cu128` torch wheels.
   Run tools with `.venv/bin/python` and `.venv/bin/hf`. pyenv shims may resolve `hf` to some
   other Python.
@@ -57,8 +57,8 @@ There are no unit tests for the inference path. Verify a change by:
   `device.f64_device()` and move the results back. Use `x.to(cpu).to(torch.float64)` in that
   order: `.to(device, dtype)` casts before moving and fails on MPS. The complex128 RoPE table
   (`model.freqs`) deliberately stays on CPU under MPS.
-- **Don't call SDPA with all heads at once on MPS.** MPS caches one MPSGraph *plus its FP32
-  score buffer* for every input shape, and `empty_cache()` cannot free it. The self-attention
+- **Don't call SDPA with all heads at once on MPS.** MPS caches one MPSGraph _plus its FP32
+  score buffer_ for every input shape, and `empty_cache()` cannot free it. The self-attention
   key length grows every frame (21 shapes), so all-heads calls retain ~60 GB. Any attention
   path must keep memory flat across key lengths.
 - **Attention on MPS defaults to the Metal flash kernel** (`fastframes/wan/mps_flash_attention.py`,
@@ -78,7 +78,7 @@ There are no unit tests for the inference path. Verify a change by:
   vs CPU) and costs minutes plus ~40 GB. Check any change here against a CPU encode.
 - **LingBot runs eager off CUDA.** torch.compile, CUDA graphs, CUDA streams, and the warm-up
   passes that feed them are gated on `device.type == "cuda"`. Verify the demo with a scripted
-  websocket client (`start`, then `action` / `displayed` messages) and time a *second* session:
+  websocket client (`start`, then `action` / `displayed` messages) and time a _second_ session:
   the first one includes Metal shader compiles.
 - **Never let an MPS job outgrow memory.** MPS swaps past 1.7x its working set by default, and a
   run that outgrew memory stalled the Mac into a watchdog panic (reboot). Long or large jobs
@@ -101,7 +101,7 @@ There are no unit tests for the inference path. Verify a change by:
 
 - Keep upstream behaviour on CUDA unchanged: gate Mac-specific code on the device type (MPS) or on
   `sys.platform`, not by editing the CUDA path.
-- Keep changes small and commented with the *why*, since upstream may be merged in again.
+- Keep changes small and commented with the _why_, since upstream may be merged in again.
 - Line length is 120 (ruff config in `pyproject.toml`).
 - Upstream doesn't accept issues or PRs. Mac-port discussion lives at
   https://huggingface.co/apple/FastFrames-S/discussions/1
