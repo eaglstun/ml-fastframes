@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A FastFrames-LingBot world generated on this Mac alone and with an iPad sharing the DiT's tokens.
 
-The iPad runs SplitStage.swift from the exo-ipad-spike app (`SPIKE_MODE=split`, mac/run_split_stage.sh
+The iPad runs SplitStage.swift from the exo-touch app (`SPIKE_MODE=split`, mac/run_split_stage.sh
 there); apps/lingbot/ipad.py (IPadAssist) is this side. Generates the same world (example 00's camera
 path, seed 0) three times: Mac alone, split with the iPad, Mac alone again. The two Mac-alone runs
 bracket the split one in time (background GPU work moves this Mac's timings) and must be identical.

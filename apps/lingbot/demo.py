@@ -491,7 +491,7 @@ def main():
                         help="save every session's video (MP4 + start image + JSON) here when it ends; "
                              "'' disables (default: outputs/lingbot_demo)")
     parser.add_argument("--ipad", metavar="HOST", help="share each DiT pass with an iPad running SplitStage "
-                        "(exo-ipad-spike, SPIKE_MODE=split) at HOST, e.g. its USB link address 169.254.x.y")
+                        "(exo-touch, SPIKE_MODE=split) at HOST, e.g. its USB link address 169.254.x.y")
     parser.add_argument("--ipad-port", type=int, default=5570)
     parser.add_argument("--ipad-share", type=float, default=0.55,
                         help="the iPad's starting fraction of each pass's tokens (rebalanced every chunk)")

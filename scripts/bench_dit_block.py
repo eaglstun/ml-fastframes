@@ -4,7 +4,7 @@
 The shapes of one chunk of the camera-control demo: 4 latent frames of queries against a rolling KV
 cache of 18 frames, Wan 2.1 1.3B blocks (dim 1536, 12 heads, FFN 8960), BF16 operands, at the
 demo's three frame sizes. The same benchmark runs on an iPad as `DiTBench.swift` in the
-exo-ipad-spike app (mac/run_dit_bench.sh there); together they say how a chunk's tokens should be
+exo-touch app (mac/run_dit_bench.sh there); together they say how a chunk's tokens should be
 split between two devices.
 
     .venv/bin/python scripts/bench_dit_block.py --backend torch     # what the demo runs (MPS)
