@@ -15,6 +15,7 @@ type Access = "owner" | "queued" | "busy" | "available";
 interface HelloMessage {
   type: "hello"; gpus: number; ready: boolean;
   sizes?: [number, number][];  // frame sizes a visitor may choose, the server's default first
+  assist?: string | null;  // another device sharing the DiT (demo.py --ipad)
 }
 interface QueueStateMessage {
   type: "queue_state"; enabled: boolean; status: Access; position: number | null;
@@ -544,7 +545,7 @@ function handleMessage(message: ServerMessage): void {
   switch (message.type) {
     case "hello":
       state.ready = Boolean(message.ready);
-      ui.gpuLabel.textContent = `${message.gpus} GPU${message.gpus === 1 ? "" : "s"}`;
+      ui.gpuLabel.textContent = `${message.gpus} GPU${message.gpus === 1 ? "" : "s"}${message.assist ? ` + ${message.assist}` : ""}`;
       renderSizes(message.sizes);
       status(state.ready ? "Ready · set the scene and start your world" : "Ready · first start warms up the model");
       updateControls();

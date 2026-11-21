@@ -31,6 +31,25 @@ def _worker(rank, config, commands, replies, rendezvous):
     from apps.lingbot import conditioning
     from apps.lingbot.conditioning import KeyboardCamera, LiveCamera
     from apps.lingbot.pipeline import FastFramesLingBot, configure_backends
+
+    def attach_ipad(pipe):
+        """Share the DiT's tokens with an iPad (--ipad); without one reachable, run on this Mac alone."""
+        if not config.get("ipad"):
+            return
+        if (conditioning.WIDTH, conditioning.HEIGHT) != (832, 464) and not config.get("ipad_all_sizes"):
+            # Smaller chunks have too little compute to hide the K/V exchange over USB (MAC.md)
+            print(f"{conditioning.WIDTH}x{conditioning.HEIGHT}: running on this Mac alone (--ipad-all-sizes "
+                  "shares every size)", flush=True)
+            return
+        from apps.lingbot.ipad import IPadAssist
+        try:
+            assist = IPadAssist.attach(pipe, config["ipad"], config.get("ipad_port") or 5570,
+                                       share=config.get("ipad_share") or 0.55)
+        except OSError as error:
+            print(f"iPad at {config['ipad']} not reachable ({error}): running on this Mac alone", flush=True)
+            return
+        print(f"iPad assist: {1 - assist.n / assist.tokens:.0%} of each pass's tokens to start, "
+              f"iPad footprint {assist.footprint / 1e9:.1f} GB", flush=True)
     from fastframes.device import default_device, release_mps_cache, synchronize
 
     pipe = None
@@ -80,6 +99,7 @@ def _worker(rank, config, commands, replies, rendezvous):
                     release_mps_cache(device)
                     conditioning.set_size(*size)
                     pipe = FastFramesLingBot(**parts)
+                    attach_ipad(pipe)
                     fingerprint = None
                 if pipe is None:
                     conditioning.set_size(*size)
@@ -91,6 +111,7 @@ def _worker(rank, config, commands, replies, rendezvous):
                         assets_dir=config.get("assets_dir") or root / "lingbot-world-v2-14b-causal-fast",
                         checkpoint_dir=root / "lingbot-1.3b", world=world, rank=rank,
                         compile=cuda, graphs=cuda)  # torch.compile/CUDA graphs are CUDA-only here
+                    attach_ipad(pipe)
                     keys, camera = KeyboardCamera(), LiveCamera(device=device)
                 next_fingerprint = (hashlib.sha256(request["image"]).hexdigest(), request["prompt"], size)
                 if fingerprint == next_fingerprint:
