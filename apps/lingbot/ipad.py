@@ -48,22 +48,24 @@ from .dit import attention, layer_norm, rms_norm, rope_real
 __all__ = ["IPadAssist", "encode", "DEFAULT_PORT"]
 
 DEFAULT_PORT = 5570
-DTYPES = {torch.bfloat16: "bfloat16", torch.float32: "float32", torch.float16: "float16"}
+DTYPES = {torch.bfloat16: "bfloat16", torch.float32: "float32", torch.float16: "float16", torch.int8: "int8"}
 TORCH_DTYPES = {name: dtype for dtype, name in DTYPES.items()}
 
 
-def _bytes(tensor):
+def _buffer(tensor):
+    """The tensor's bytes, without copying them out of a contiguous CPU tensor."""
     tensor = tensor.detach().contiguous().cpu()
     if tensor.dtype == torch.bfloat16:
         tensor = tensor.view(torch.int16)
-    return tensor.numpy().tobytes()
+    return memoryview(tensor.numpy()).cast("B")
 
 
 def encode(op, *, layer=0, meta=None, arrays=()):
-    """One frame: ``arrays`` is a sequence of (name, tensor)."""
+    """One frame, as the buffers to send in order: ``arrays`` is a sequence of (name, tensor). The
+    arrays' bytes are views (a K/V frame is ~25 MB: joining it into one bytes object costs copies)."""
     specs = [{"name": name, "shape": list(t.shape), "dtype": DTYPES[t.dtype]} for name, t in arrays]
     header = json.dumps({"op": op, "layer": layer, "meta": meta or {}, "arrays": specs}).encode()
-    return b"".join([struct.pack("<I", len(header)), header] + [_bytes(t) for _, t in arrays])
+    return [struct.pack("<I", len(header)) + header] + [_buffer(t) for _, t in arrays]
 
 
 class Link:
@@ -74,16 +76,24 @@ class Link:
         self.sock.settimeout(600)  # a pass, or the weights at setup, can take a while
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.device, self.outbox = device, queue.Queue()
-        self.timing = {"socket": 0.0, "decode": 0.0, "encode": 0.0}  # seconds, for profiling
+        # seconds, for profiling: socket (waiting and receiving), receive (first byte to last), decode, encode,
+        # sending (in sendall: the wire, once the iPad reads)
+        self.timing = {"socket": 0.0, "receive": 0.0, "decode": 0.0, "encode": 0.0, "sending": 0.0}
         self.sender = threading.Thread(target=self._send_loop, daemon=True)
         self.sender.start()
 
     def _send_loop(self):
-        while (data := self.outbox.get()) is not None:
-            self.sock.sendall(data)
+        import time
 
-    def send(self, data):
-        self.outbox.put(data)
+        while (buffers := self.outbox.get()) is not None:
+            started = time.perf_counter()
+            for buffer in buffers:
+                self.sock.sendall(buffer)
+            self.timing["sending"] += time.perf_counter() - started
+
+    def send(self, buffers):
+        """Queue one frame (``encode``'s buffers) for the sender thread."""
+        self.outbox.put(buffers)
 
     def _exactly(self, count):
         buffer = bytearray(count)
@@ -100,6 +110,7 @@ class Link:
 
         start = time.perf_counter()
         (length,) = struct.unpack("<I", self._exactly(4))
+        first = time.perf_counter()
         header = json.loads(self._exactly(length))
         if header["op"] == "error":
             raise RuntimeError(f"iPad: {header['meta'].get('message')}")
@@ -108,12 +119,14 @@ class Link:
         raws = []
         for spec in header["arrays"]:
             dtype = TORCH_DTYPES[spec["dtype"]]
-            count = int(np.prod(spec["shape"])) * (4 if dtype == torch.float32 else 2)
+            count = int(np.prod(spec["shape"])) * dtype.itemsize
             raws.append((spec, dtype, self._exactly(count)))
         received = time.perf_counter()
         arrays = {spec["name"]: torch.frombuffer(raw, dtype=dtype).view(spec["shape"]).to(self.device)
                   for spec, dtype, raw in raws}
+        self.last_received = received  # the last byte; decoding (.to(device)) waits for queued GPU work
         self.timing["socket"] += received - start
+        self.timing["receive"] += received - first
         self.timing["decode"] += time.perf_counter() - received
         return header, arrays
 
@@ -124,6 +137,22 @@ class Link:
             self.sender.join(timeout=10)
         finally:
             self.sock.close()
+
+
+def quantize(x):
+    """8-bit K/V for the wire: each token and head's ``D`` values as int8 with one FP32 scale (absmax / 127),
+    51.6% of their BF16 bytes. Returns (int8 ``[..., D]``, scale ``[..., 1]``), both contiguous."""
+    xf = x.float()
+    scale = xf.abs().amax(-1, keepdim=True).clamp_min(1e-12) / 127
+    return torch.round(xf / scale).to(torch.int8), scale
+
+
+def received_kv(arrays, dtype):
+    """The other side's K/V from a "kv" frame, dequantized if it came as 8-bit."""
+    if "k_scale" in arrays:
+        return ((arrays["k"].float() * arrays["k_scale"]).to(dtype),
+                (arrays["v"].float() * arrays["v_scale"]).to(dtype))
+    return arrays["k"], arrays["v"]
 
 
 def block_pre(block, value, qkv_weight, qkv_bias, rope, time_e0, heads):
@@ -158,7 +187,7 @@ class IPadAssist:
     # Shares move in steps of this many tokens: each new share compiles new graphs on the iPad
     STEP = 128
 
-    def __init__(self, pipe, host, port=DEFAULT_PORT, share=0.55, adaptive=True, overlap=True):
+    def __init__(self, pipe, host, port=DEFAULT_PORT, share=0.55, adaptive=True, overlap=True, kv_bits=16):
         dit = pipe.dit
         if dit.world != 1:
             raise ValueError("iPad assist runs with a single-device pipeline")
@@ -168,6 +197,9 @@ class IPadAssist:
         self.adaptive = adaptive
         # Attend over the older cache rows while the K/V are in flight (needs the Metal flash kernel)
         self.overlap = overlap and pipe.device.type == "mps"
+        # The K/V cross the link as 16-bit, or 8-bit (half the bytes, the same frames within the run-to-run
+        # drift; no faster yet, measured against the iPad's throttling); each side keeps its own exactly
+        self.kv_bits = kv_bits
         self.link = Link(host, port, pipe.device)
         # latency: per block, this Mac's send-to-receive time minus the iPad's arrival-to-send time (the
         # exchange both ways, transfer and copies); summed over passes
@@ -190,11 +222,12 @@ class IPadAssist:
         self._rates = []
 
     @classmethod
-    def attach(cls, pipe, host, port=DEFAULT_PORT, share=0.55, adaptive=True, overlap=True):
+    def attach(cls, pipe, host, port=DEFAULT_PORT, share=0.55, adaptive=True, overlap=True, kv_bits=16):
         """Connect, send the weights, and route ``pipe``'s DiT passes and cache events through the iPad.
         ``share``: the iPad's starting fraction of the tokens; ``adaptive`` rebalances it every chunk;
-        ``overlap`` hides the K/V exchange behind attention over the older cache rows."""
-        assist = cls(pipe, host, port, share, adaptive, overlap)
+        ``overlap`` hides the K/V exchange behind attention over the older cache rows; ``kv_bits`` (8 or 16)
+        is how the K/V cross the link."""
+        assist = cls(pipe, host, port, share, adaptive, overlap, kv_bits)
         dit = pipe.dit
         assist._originals = {name: getattr(dit, name) for name in ("_run", "begin_chunk", "set_context")}
         dit._run = assist.run
@@ -306,26 +339,34 @@ class IPadAssist:
         began = time.perf_counter()
         value0 = dit._patch_run()
         overlap = self.overlap and rows > 0  # the first chunk has no older rows to attend over
-        self.link.send(encode("pass", meta={"end": end, "overlap": overlap},
+        self.link.send(encode("pass", meta={"end": end, "overlap": overlap, "kv_bits": self.kv_bits},
                               arrays=[("time_e0", dit.time_e0), ("value", value0[:, n:])]))
         value, waited, turn, sent = value0[:, :n], 0.0, 0.0, 0.0
         for i, block in enumerate(dit.model.blocks):
             cache_k, cache_v = dit.cache_k[i], dit.cache_v[i]
             e, query, key, val = block_pre(block, value, *dit.qkv[i], dit.rope[:n], dit.time_e0, dit.heads)
             encoding = time.perf_counter()
+            if self.kv_bits == 8:
+                (kq, ks), (vq, vs) = quantize(key), quantize(val)
+                outgoing = (("k", kq), ("k_scale", ks), ("v", vq), ("v_scale", vs))
+            else:
+                outgoing = (("k", key), ("v", val))
             if overlap:
                 # Copy the K/V out, then queue attention over the older rows behind the copy; the events
                 # commit both to the GPU, and only the copy is waited for before sending. A non-blocking
                 # copy of a non-contiguous MPS tensor (``val`` is a slice of the QKV output) comes back
                 # wrong (PyTorch 2.9): make it contiguous on the GPU first
-                kv = [(name, t.contiguous().to("cpu", non_blocking=True)) for name, t in (("k", key), ("v", val))]
+                kv = [(name, t.contiguous().to("cpu", non_blocking=True)) for name, t in outgoing]
                 copied = torch.mps.Event()
                 copied.record()
                 older = flash_attention_lse(query, cache_k[:, :rows], cache_v[:, :rows])
                 torch.mps.Event().record()
-                copied.synchronize()
+                # Event.synchronize() holds the GIL while it waits (PyTorch 2.9), which stalls the sender
+                # thread mid-frame: poll instead (each sleep releases it)
+                while not copied.query():
+                    time.sleep(0.0002)
             else:
-                kv = [("k", key), ("v", val)]
+                kv = list(outgoing)
             self.link.send(encode("kv", layer=i, arrays=kv))
             self.link.timing["encode"] += time.perf_counter() - encoding
             if i > 0:
@@ -337,9 +378,10 @@ class IPadAssist:
             _, theirs = self.link.read("kv", i)
             waited += time.perf_counter() - start
             if i > 0:  # the iPad's K/V of block i answer this Mac's of block i - 1
-                turn += time.perf_counter()
-            cache_k[:, rows + n:end] = rope_real(theirs["k"], dit.rope[n:])
-            cache_v[:, rows + n:end] = theirs["v"]
+                turn += self.link.last_received
+            their_k, their_v = received_kv(theirs, key.dtype)
+            cache_k[:, rows + n:end] = rope_real(their_k, dit.rope[n:])
+            cache_v[:, rows + n:end] = their_v
             if overlap:
                 attended = merge_attention(*older, *flash_attention_lse(query, cache_k[:, rows:end],
                                                                          cache_v[:, rows:end]), query.dtype)
@@ -347,9 +389,9 @@ class IPadAssist:
                 attended = attention(query, cache_k[:, :end], cache_v[:, :end], 1)
             if capture:  # canonical K/V of every token, for the KV refiner
                 dit.result.key[i][:, :n] = key
-                dit.result.key[i][:, n:] = theirs["k"]
+                dit.result.key[i][:, n:] = their_k
                 dit.result.value[i][:, :n] = val
-                dit.result.value[i][:, n:] = theirs["v"]
+                dit.result.value[i][:, n:] = their_v
             value = block_post(block, value, e, attended, dit.text_k[i], dit.text_v[i],
                                dit.camera_params[i][:, :, :n])
         start = time.perf_counter()
