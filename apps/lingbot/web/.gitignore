@@ -1,0 +1,3 @@
+node_modules/
+.build-check/
+.e2e/

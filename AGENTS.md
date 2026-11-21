@@ -22,6 +22,9 @@ targets Linux + NVIDIA.
   `demo_worker.py` (browser demo, websocket at `/ws`), `pipeline.py` (chunked rollout),
   `upstream.py` (imports the pinned clone in `upstream/lingbot-world-v2`; treat that clone as
   read-only third-party code and patch around it here).
+- `apps/lingbot/web/`: TypeScript source of the demo page (`src/app.ts`). It compiles to
+  `apps/lingbot/static/app.js`, which is committed: edit the `.ts`, then `npm run build` and
+  `npm run verify` there. `npm run e2e` drives a running demo in headless Chrome.
 
 ## Environment
 

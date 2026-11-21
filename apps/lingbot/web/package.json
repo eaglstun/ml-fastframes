@@ -1,0 +1,16 @@
+{
+  "name": "lingbot-demo-web",
+  "private": true,
+  "description": "Browser client of the LingBot demo; builds ../static/app.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p .",
+    "check": "tsc -p . --noEmit",
+    "watch": "tsc -p . --watch",
+    "verify": "tsc -p . --outDir .build-check && diff -q .build-check/app.js ../static/app.js && echo 'static/app.js matches src/app.ts'",
+    "e2e": "node e2e.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}
