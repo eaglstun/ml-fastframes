@@ -72,11 +72,22 @@ uv run --extra lingbot torchrun --nproc_per_node 8 apps/lingbot/generate.py --mo
 Output is 832 × 464 at 16 fps. The first chunk contains 13 frames and subsequent chunks
 contain 16; `--frames 961` selects 60 whole chunks, producing 957 frames.
 
+`--size WxH` (`generate.py`, `latency.py` and `demo.py`, one device) generates at another size,
+both sides multiples of 16. Only 832 × 464 is what LingBot and the FastFrames networks were trained
+at: smaller sizes run much faster but are out of distribution (softer frames at 576 × 320; at
+416 × 240 the scene melts and stops following the camera). `latency.py` records the size, and
+`summarize.py` skips records not taken at 832 × 464. Measurements are in [MAC.md](../MAC.md).
+
 For your own scene, replace `--example ...` with `--condition scene.json`:
 
 ```json
-{"image": "street.jpg", "prompt": "A rainy street at night", "seed": 0,
- "poses": "poses.npy", "intrinsics": "intrinsics.npy"}
+{
+  "image": "street.jpg",
+  "prompt": "A rainy street at night",
+  "seed": 0,
+  "poses": "poses.npy",
+  "intrinsics": "intrinsics.npy"
+}
 ```
 
 Paths are relative to the JSON file. `poses.npy` contains `[N, 4, 4]` OpenCV
@@ -87,8 +98,12 @@ Use images close to 16:9. Camera-path translations are normalized, preserving di
 Alternatively, replace `poses` and `intrinsics` with an `actions` list, one action per chunk:
 
 ```json
-{"image": "street.jpg", "prompt": "A rainy street at night", "seed": 0,
- "actions": ["idle", "forward", "forward", "yaw_left", "forward"]}
+{
+  "image": "street.jpg",
+  "prompt": "A rainy street at night",
+  "seed": 0,
+  "actions": ["idle", "forward", "forward", "yaw_left", "forward"]
+}
 ```
 
 Available actions: `forward`, `backward`, `left`, `right`, `up`, `down`, `yaw_left`,
@@ -112,8 +127,8 @@ are timed. Results use the median chunk latency of the slowest rank, then the me
 across three processes. Timing excludes host transfer and display.
 
 | Model | 1 GPU (ms) | 8 GPUs (ms) |
-|---|---:|---:|
-| 1.3B | 220.7 | 50.5 |
+| ----- | ---------: | ----------: |
+| 1.3B  |      220.7 |        50.5 |
 
 These B200 measurements use PyTorch 2.9.1 / CUDA 12.8. Timings vary with hardware and
 compiler autotuning. For individual runs and options, use

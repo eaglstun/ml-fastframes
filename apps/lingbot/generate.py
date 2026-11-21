@@ -24,7 +24,7 @@ import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from apps.lingbot.conditioning import CHUNK, KeyboardCamera, LiveCamera, Trajectory  # noqa: E402
+from apps.lingbot.conditioning import CHUNK, DEFAULT_SIZE, KeyboardCamera, LiveCamera, Trajectory, parse_size, set_size  # noqa: E402
 from apps.lingbot.pipeline import MODELS, FastFramesLingBot, configure_backends  # noqa: E402
 from apps.lingbot.upstream import import_upstream  # noqa: E402
 from fastframes.device import default_device, synchronize  # noqa: E402
@@ -44,6 +44,16 @@ def add_model_arguments(parser):
     parser.add_argument("--assets-dir", type=Path, help="T5/VAE/tokenizer if not in --lingbot-checkpoint "
                         "(default: <checkpoint-dir>/lingbot-world-v2-14b-causal-fast)")
     parser.add_argument("--eager", action="store_true", help="no torch.compile and no CUDA graphs")
+    parser.add_argument("--size", type=parse_size, default=DEFAULT_SIZE, metavar="WxH",
+                        help="frame size, multiples of 16 (default 832x464, the trained size; smaller is faster "
+                             "and out of distribution, e.g. 576x320, see conditioning.set_size)")
+
+
+def apply_size(args, world):
+    """Set the frame size of ``--size``; call before building cameras or the pipeline."""
+    if tuple(args.size) != DEFAULT_SIZE and world > 1:
+        raise ValueError("--size other than 832x464 was only tried on one device")
+    set_size(*args.size)
 
 
 def init_distributed():
@@ -119,6 +129,7 @@ def main():
     args = parser.parse_args()
 
     world, rank = init_distributed()
+    apply_size(args, world)
     import_upstream(args.lingbot_root)
     image, prompt, rays, chunks, seed = read_condition(args)
     pipe = load_pipeline(args, world, rank)

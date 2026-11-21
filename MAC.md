@@ -25,12 +25,12 @@ Do not `uv sync`: pyproject pins the `+cu128` wheels. ffmpeg with libx264 must b
 
 ## Performance (M4 Max)
 
-| | |
-|---|---|
-| load | ~5 s |
-| text encode | ~0.5 s |
+|                                      |                                                  |
+| ------------------------------------ | ------------------------------------------------ |
+| load                                 | ~5 s                                             |
+| text encode                          | ~0.5 s                                           |
 | rollout + decode + encode, per video | ~45-49 s (was ~63-78 s with MPS SDPA, see below) |
-| peak memory footprint | ~18 GB |
+| peak memory footprint                | ~18 GB                                           |
 
 The paper reports 36 ms per latent frame on a B200. The MPS rollout is compute-bound: with PyTorch's
 SDPA about 2/3 of the time was self-attention over the growing KV cache (up to 32,760 keys) and the
@@ -70,13 +70,13 @@ switches back to PyTorch SDPA (one head per call); `flash` is the default.
 Measured on the M4 Max (`scripts/bench_mps_attention.py`; q `[1, 1560, 12, 128]`, warm,
 synchronized, median):
 
-| keys | flash | SDPA per head |
-|---|---|---|
-| 512 (cross-attention) | 1.1 ms | 1.8 ms |
-| 1,560 | 1.5 ms | 3.0 ms |
-| 15,600 | 11.8 ms | 28.5 ms |
-| 32,760 | 24.9 ms | 64.2 ms |
-| sum over the 21 KV lengths | **275 ms** | 673 ms |
+| keys                       | flash      | SDPA per head |
+| -------------------------- | ---------- | ------------- |
+| 512 (cross-attention)      | 1.1 ms     | 1.8 ms        |
+| 1,560                      | 1.5 ms     | 3.0 ms        |
+| 15,600                     | 11.8 ms    | 28.5 ms       |
+| 32,760                     | 24.9 ms    | 64.2 ms       |
+| sum over the 21 KV lengths | **275 ms** | 673 ms        |
 
 That is ~12.6 TFLOPS for the whole attention (13.0 at LingBot's 6,032 x 27,144), against ~5 for SDPA
 and 13-14.7 for a bare MPS GEMM; a loop of nothing but register-to-register 8x8 multiplies reaches ~14.
@@ -120,14 +120,14 @@ $HF download robbyant/lingbot-world-v2-14b-causal-fast \
 Measured on the M4 Max with the demo server driven by a scripted websocket client (scene 00,
 idle GPU). Each turn is one chunk: 16 frames, 1 s of 16 fps video at 832x464.
 
-| | first session after server start | warm session (same server) |
-|---|---|---|
-| world ready | 16.0 s | 0.0 s (scene reused) |
-| chunk 0 (13 frames) | 19.6 s | 12.5 s |
-| turn 1 | 24.2 s | 14.2 s |
-| turn 2 | 26.3 s | 18.1 s |
-| turn 3 | 29.3 s | 22.0 s |
-| turns 4-8 | 31.2-34.3 s | 23.5-24.0 s |
+|                     | first session after server start | warm session (same server) |
+| ------------------- | -------------------------------- | -------------------------- |
+| world ready         | 16.0 s                           | 0.0 s (scene reused)       |
+| chunk 0 (13 frames) | 19.6 s                           | 12.5 s                     |
+| turn 1              | 24.2 s                           | 14.2 s                     |
+| turn 2              | 26.3 s                           | 18.1 s                     |
+| turn 3              | 29.3 s                           | 22.0 s                     |
+| turns 4-8           | 31.2-34.3 s                      | 23.5-24.0 s                |
 
 The first session pays one-time Metal shader compiles and allocations for new shapes. Turns
 get slower while the rolling KV cache fills (it holds 18 latent frames, full after about five
@@ -136,19 +136,42 @@ chunks) and then hold at ~24 s, in line with `latency.py`'s 25.9 s per full-cach
 83 GB (upstream conditioning) to 43 GB on a 2-chunk `generate.py` run; since the pipeline releases
 cached blocks after each chunk, `latency.py` holds a flat ~23 GB of driver memory.
 
+### Smaller frames for speed (`--size`)
+
+`generate.py`, `latency.py` and `demo.py` take `--size WxH` (multiples of 16, one device). Only
+832x464 is what LingBot and the FastFrames refiner/decoder were trained at, so smaller sizes trade
+fidelity for speed. Example 00, seed 0, same camera path, M4 Max:
+
+| size    | tokens/frame | full-cache chunk (`generate`-style, condition inline) | demo turn (5 s think time) | look                                                                                |
+| ------- | ------------ | ----------------------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------- |
+| 832x464 | 1508         | 30.9 s                                                | ~20-25 s                   | the model as trained                                                                |
+| 576x320 | 720          | 7.2 s                                                 | **4.6-5.9 s** (turns 1-8)  | softer detail, coherent; a different take on the scene; follows the camera less far |
+| 416x240 | 390          | 3.6 s                                                 | not measured               | melts within ~8 chunks (the horse smears) and stops following the camera            |
+
+At 576x320 attention shrinks faster than the token count (both the chunk and the cache get
+smaller), so a chunk is 4.3x faster for 2.1x fewer tokens. A 125-frame `generate.py` video takes
+60 s, and the demo peaks at ~13 GB of MPS memory against ~18 GB at full size. A different size
+draws different noise, so it's a different world from the same image and prompt, not a
+downscaled one. `latency.py` records the size and `summarize.py` skips records not taken at
+832x464.
+
+```bash
+.venv/bin/python apps/lingbot/demo.py --gpus 1 --lingbot-root upstream/lingbot-world-v2 --size 576x320
+```
+
 What changed for LingBot:
 
-| Problem on Mac | Fix |
-|---|---|
-| Upstream `wan/modules/t5.py` evaluates `torch.cuda.current_device()` as a default argument at import time | `upstream.py` stubs it to `"cpu"` only during that import, without CUDA; the clone isn't modified |
+| Problem on Mac                                                                                                                                                                                                  | Fix                                                                                                                                                                             |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Upstream `wan/modules/t5.py` evaluates `torch.cuda.current_device()` as a default argument at import time                                                                                                       | `upstream.py` stubs it to `"cpu"` only during that import, without CUDA; the clone isn't modified                                                                               |
 | The image condition was VAE-encoded for the whole 60-chunk horizon before the first frame: minutes of work, ~40 GB extra, and on MPS the **last latent comes out wrong** (0.4 max abs error vs a CPU reference) | `conditioning.LazyImageCondition` runs the same causal encoder (same feature cache) one latent at a time, just before each chunk needs it; it matches the CPU reference to 7e-6 |
-| umT5 built with random FP32 init: 82 s to load | Meta-device build + `load_state_dict(assign=True)` from an mmapped checkpoint: 0.9 s, bit-identical embeddings |
-| complex128 RoPE table, float64 timestep sinusoids and x0 update | Computed on CPU, results moved to MPS (as for FastFrames-S) |
-| Attention uses split-KV SDPA tuned for CUDA | On MPS it calls `fastframes.wan.attention`, i.e. the Metal flash kernel |
-| `torch.autocast("cuda")`, CUDA streams for KV-refinement head groups and decoder warm-up, `torch.cuda.synchronize` | Autocast on the tensor's device type; head groups run sequentially and warm-ups are skipped off CUDA; `fastframes.device.synchronize` |
-| torch.compile (inductor max-autotune), CUDA graphs, demo warm-up passes that only exist to trigger them | Eager off CUDA (`generate.py` picks it automatically; the demo worker passes `compile=False, graphs=False`) |
-| `from_pretrained(device=None)` left the refiner/decoder on CPU | The device is resolved once at the top (`default_device()`) |
-| Demo memory stats call `torch.cuda` | MPS reports `current_allocated_memory` / `driver_allocated_memory` |
+| umT5 built with random FP32 init: 82 s to load                                                                                                                                                                  | Meta-device build + `load_state_dict(assign=True)` from an mmapped checkpoint: 0.9 s, bit-identical embeddings                                                                  |
+| complex128 RoPE table, float64 timestep sinusoids and x0 update                                                                                                                                                 | Computed on CPU, results moved to MPS (as for FastFrames-S)                                                                                                                     |
+| Attention uses split-KV SDPA tuned for CUDA                                                                                                                                                                     | On MPS it calls `fastframes.wan.attention`, i.e. the Metal flash kernel                                                                                                         |
+| `torch.autocast("cuda")`, CUDA streams for KV-refinement head groups and decoder warm-up, `torch.cuda.synchronize`                                                                                              | Autocast on the tensor's device type; head groups run sequentially and warm-ups are skipped off CUDA; `fastframes.device.synchronize`                                           |
+| torch.compile (inductor max-autotune), CUDA graphs, demo warm-up passes that only exist to trigger them                                                                                                         | Eager off CUDA (`generate.py` picks it automatically; the demo worker passes `compile=False, graphs=False`)                                                                     |
+| `from_pretrained(device=None)` left the refiner/decoder on CPU                                                                                                                                                  | The device is resolved once at the top (`default_device()`)                                                                                                                     |
+| Demo memory stats call `torch.cuda`                                                                                                                                                                             | MPS reports `current_allocated_memory` / `driver_allocated_memory`                                                                                                              |
 
 ## Latency benchmarks
 
@@ -165,13 +188,13 @@ Metal flash kernel and the split-KV setting is ignored. The protocol is otherwis
 
 FastFrames-S, one step (one latent frame, 4 video frames) with a full 21-frame cache, M4 Max:
 
-| Component | M4 Max | B200 (README) |
-|---|---:|---:|
-| DiT evaluation, t=1000 | 1340.3 ms | 16.1 ms |
-| DiT evaluation, t=833 | 1676.8 ms | 16.2 ms |
-| KV refinement | 119.6 ms | 2.2 ms |
-| Pixel decoder | 57.4 ms | 0.9 ms |
-| **Total** | **3194 ms** | **35.4 ms** |
+| Component              |      M4 Max | B200 (README) |
+| ---------------------- | ----------: | ------------: |
+| DiT evaluation, t=1000 |   1340.3 ms |       16.1 ms |
+| DiT evaluation, t=833  |   1676.8 ms |       16.2 ms |
+| KV refinement          |    119.6 ms |        2.2 ms |
+| Pixel decoder          |     57.4 ms |        0.9 ms |
+| **Total**              | **3194 ms** |   **35.4 ms** |
 
 The two DiT rows do the same work; the second is slower because `benchmark.py` runs the
 components back to back and the chip is hotter by then. Profiled alone after a 5-minute
@@ -251,17 +274,18 @@ What's left in a full-cache LingBot chunk is mostly attention (~60%) and GEMMs, 
 
 ## What was changed for FastFrames-S (see `git diff`)
 
-| Problem on Mac | Fix |
-|---|---|
-| `device="cuda"` hardcoded in the loader, pipeline, and autocast | `fastframes/device.py`: `$FASTFRAMES_DEVICE`, else cuda > mps > cpu |
-| `sdpa_kernel(CUDNN_ATTENTION)` | Used only on CUDA |
-| MPS has no float64/complex128 (timestep sinusoids, scheduler x0, RoPE) | float64 math runs on CPU (bit-exact); RoPE uses a cached complex128 table applied as FP32 rotations (within 1 bf16 ulp, 99.998% identical) |
-| MPS SDPA caches one MPSGraph **plus its FP32 score buffer** per shape; the KV prefix grows every frame, so 21 shapes retained ~56-68 GB that `empty_cache()` can't free | Default: the Metal flash-attention kernel above (no per-shape state). SDPA fallback: one head per call, ~6 GB retained |
-| Allocator hoards odd-sized buffers | `synchronize()` + `empty_cache()` after each frame on MPS |
-| umT5 (11 GB) stays resident during the rollout | `generate.py` encodes all prompts first, then moves T5 to CPU |
-| T5 built with random FP32 init (48 s, 22 GB RAM) before loading bf16 weights | Built on the meta device and assigned the checkpoint (same result) |
-| OpenH264 binary is linux64-only (ctypes) | Non-Linux `save_video` uses ffmpeg/libx264, BT.601 limited range, faststart |
+| Problem on Mac                                                                                                                                                          | Fix                                                                                                                                        |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `device="cuda"` hardcoded in the loader, pipeline, and autocast                                                                                                         | `fastframes/device.py`: `$FASTFRAMES_DEVICE`, else cuda > mps > cpu                                                                        |
+| `sdpa_kernel(CUDNN_ATTENTION)`                                                                                                                                          | Used only on CUDA                                                                                                                          |
+| MPS has no float64/complex128 (timestep sinusoids, scheduler x0, RoPE)                                                                                                  | float64 math runs on CPU (bit-exact); RoPE uses a cached complex128 table applied as FP32 rotations (within 1 bf16 ulp, 99.998% identical) |
+| MPS SDPA caches one MPSGraph **plus its FP32 score buffer** per shape; the KV prefix grows every frame, so 21 shapes retained ~56-68 GB that `empty_cache()` can't free | Default: the Metal flash-attention kernel above (no per-shape state). SDPA fallback: one head per call, ~6 GB retained                     |
+| Allocator hoards odd-sized buffers                                                                                                                                      | `synchronize()` + `empty_cache()` after each frame on MPS                                                                                  |
+| umT5 (11 GB) stays resident during the rollout                                                                                                                          | `generate.py` encodes all prompts first, then moves T5 to CPU                                                                              |
+| T5 built with random FP32 init (48 s, 22 GB RAM) before loading bf16 weights                                                                                            | Built on the meta device and assigned the checkpoint (same result)                                                                         |
+| OpenH264 binary is linux64-only (ctypes)                                                                                                                                | Non-Linux `save_video` uses ffmpeg/libx264, BT.601 limited range, faststart                                                                |
 
 Not ported: training (NCCL, Triton flex_attention, CUDA RNG state), FastFrames-L (14B: ~28 GB DiT
-+ ~26 GB KV cache + T5 does not fit in 64 GB without offloading), multi-device LingBot
-(`--gpus 8`, torchrun), and the multi-GPU and baseline latency rows.
+
+- ~26 GB KV cache + T5 does not fit in 64 GB without offloading), multi-device LingBot
+  (`--gpus 8`, torchrun), and the multi-GPU and baseline latency rows.

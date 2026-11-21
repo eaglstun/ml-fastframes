@@ -43,7 +43,7 @@ from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
 __all__ = ["LingBotDiT", "DiTResult", "rope_real", "rope_table", "rope_frequencies", "all_gather_into"]
 
 GRID_H, GRID_W = LATENT_HEIGHT // 2, LATENT_WIDTH // 2
-FRAME_TOKENS = GRID_H * GRID_W          # 1508
+FRAME_TOKENS = GRID_H * GRID_W          # 1508 (at 832 x 464; see conditioning.set_size)
 TOKENS = CHUNK * FRAME_TOKENS           # 6032
 CACHE_FRAMES = 18                       # rolling cache, including the current chunk
 READ_FRAMES = (4, 8, 12, 16, 18)

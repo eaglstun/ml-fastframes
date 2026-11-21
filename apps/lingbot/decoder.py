@@ -36,8 +36,9 @@ COMPILE_OPTIONS = {"max_autotune": True, "coordinate_descent_tuning": True,
 class StreamingDecoder(torch.nn.Module):
     """Four-latent causal decoding with per-block input history (``rows`` token rows)."""
 
-    def __init__(self, decoder, rows=GRID_H, width=GRID_W):
+    def __init__(self, decoder, rows=None, width=None):
         super().__init__()
+        rows, width = rows or GRID_H, width or GRID_W  # read at call time: ``set_size`` updates them
         self.decoder = decoder
         head = self.decoder
         self.rows, self.width, self.dim = rows, width, head.dim
