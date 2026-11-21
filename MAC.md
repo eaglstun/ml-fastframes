@@ -350,11 +350,15 @@ BF16 step there) and takes:
 | PyTorch MPS (the demo today) | 144.1 ms | 17.3 s |
 | MLX eager | 136.7 ms (1.05x) | 16.4 s |
 | MLX `mx.compile` | 127.4 ms (1.13x) | 15.3 s |
+| iPad Pro 11" M5, MLX-Swift compiled (`DiTBlockCheck.swift`) | 156.8 ms (0.92x) | 18.8 s |
 
-So moving the Mac to MLX would buy ~13%, not the ~1.4x the synthetic blocks suggested. With half
-the tokens on an iPad about as fast as the Mac, a full-size chunk's DiT would take roughly
-120 x (72 ms compute + ~22 ms transfer) = ~11 s instead of ~17 s, more if transfers overlap
-compute. At 576x320 the gain shrinks to ~1.2-1.5x and at 416x240 the transfers cancel it. Building
+The iPad's block matches PyTorch to 1.2e-3 relative L2 (max 0.089 on values up to 33, under one
+BF16 step there); eager it takes 209.7 ms, so compiling matters more there than on the Mac.
+
+So moving the Mac to MLX would buy ~13%, not the ~1.4x the synthetic blocks suggested. With the
+iPad at 0.92x the Mac, it should take ~48% of the tokens; a full-size chunk's DiT would then take
+roughly 120 x (75 ms compute + ~22 ms transfer) = ~11.6 s instead of ~17.3 s (1.5x), up to ~1.9x
+if transfers overlap compute. At 576x320 the gain shrinks to ~1.2-1.5x and at 416x240 the transfers cancel it. Building
 it needs the block in MLX-Swift (`lingbot_block_mlx.py` is the reference), a K/V exchange per layer,
 and the refined cache sent to the iPad between turns.
 
