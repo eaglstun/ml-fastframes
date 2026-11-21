@@ -67,6 +67,7 @@ class Link:
         self.sock.settimeout(600)  # a pass, or the weights at setup, can take a while
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.device, self.outbox = device, queue.Queue()
+        self.timing = {"socket": 0.0, "decode": 0.0, "encode": 0.0}  # seconds, for profiling
         self.sender = threading.Thread(target=self._send_loop, daemon=True)
         self.sender.start()
 
@@ -88,17 +89,25 @@ class Link:
         return buffer
 
     def read(self, op=None, layer=None):
+        import time
+
+        start = time.perf_counter()
         (length,) = struct.unpack("<I", self._exactly(4))
         header = json.loads(self._exactly(length))
         if header["op"] == "error":
             raise RuntimeError(f"iPad: {header['meta'].get('message')}")
         if (op is not None and header["op"] != op) or (layer is not None and header["layer"] != layer):
             raise RuntimeError(f"expected {op} {layer} from the iPad, got {header['op']} {header['layer']}")
-        arrays = {}
+        raws = []
         for spec in header["arrays"]:
             dtype = TORCH_DTYPES[spec["dtype"]]
-            raw = self._exactly(int(np.prod(spec["shape"])) * (4 if dtype == torch.float32 else 2))
-            arrays[spec["name"]] = torch.frombuffer(raw, dtype=dtype).view(spec["shape"]).to(self.device)
+            count = int(np.prod(spec["shape"])) * (4 if dtype == torch.float32 else 2)
+            raws.append((spec, dtype, self._exactly(count)))
+        received = time.perf_counter()
+        arrays = {spec["name"]: torch.frombuffer(raw, dtype=dtype).view(spec["shape"]).to(self.device)
+                  for spec, dtype, raw in raws}
+        self.timing["socket"] += received - start
+        self.timing["decode"] += time.perf_counter() - received
         return header, arrays
 
     def close(self):
@@ -289,7 +298,9 @@ class IPadAssist:
         value, waited = value0[:, :n], 0.0
         for i, block in enumerate(dit.model.blocks):
             e, query, key, val = block_pre(block, value, *dit.qkv[i], dit.rope[:n], dit.time_e0, dit.heads)
+            encoding = time.perf_counter()
             self.link.send(encode("kv", layer=i, arrays=[("k", key), ("v", val)]))
+            self.link.timing["encode"] += time.perf_counter() - encoding
             dit.cache_k[i][:, rows:rows + n] = rope_real(key, dit.rope[:n])
             dit.cache_v[i][:, rows:rows + n] = val
             start = time.perf_counter()

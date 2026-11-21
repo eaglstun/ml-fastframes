@@ -58,6 +58,10 @@ def main():
     parser.add_argument("--ipad-share", type=float, default=0.55, help="fraction of each chunk's tokens on the iPad")
     parser.add_argument("--chunks", type=int, default=10)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--split-only", action="store_true", help="profile the split run alone (no Mac-alone runs)")
+    parser.add_argument("--fixed-share", action="store_true", help="keep --ipad-share for every chunk")
+    parser.add_argument("--no-row-sync", action="store_true",
+                        help="diagnostic: don't send the refined rows to the iPad (its frames go wrong)")
     args = parser.parse_args()
     limit_mps_memory(0.75)
     apply_size(args, 1)
@@ -70,15 +74,25 @@ def main():
     pipe = load_pipeline(args, 1, 0)
     args.out.mkdir(parents=True, exist_ok=True)
 
-    print("Mac alone", flush=True)
-    alone, alone_times = generate(pipe, image, prompt, trajectory)
+    if not args.split_only:
+        print("Mac alone", flush=True)
+        alone, alone_times = generate(pipe, image, prompt, trajectory)
     started = time.perf_counter()
-    assist = IPadAssist.attach(pipe, args.ipad, args.port, share=args.ipad_share)
+    assist = IPadAssist.attach(pipe, args.ipad, args.port, share=args.ipad_share, adaptive=not args.fixed_share)
+    if args.no_row_sync:
+        assist.sync_rows = lambda read_frames: None
     print(f"with the iPad ({1 - assist.n / assist.tokens:.0%} of the tokens; setup "
           f"{time.perf_counter() - started:.1f} s, iPad footprint {assist.footprint / 1e9:.1f} GB)", flush=True)
     split, split_times = generate(pipe, image, prompt, trajectory)
     passes, waited = assist.stats["passes"], assist.stats["wait"]
     shares, thermal = assist.stats["shares"], assist.stats["thermal"]
+    per_pass = {k: v / max(passes, 1) for k, v in assist.link.timing.items()}
+    print(f"per pass on this Mac: encode K/V {per_pass['encode']:.2f} s (GPU sync + copy), waiting on the socket "
+          f"{per_pass['socket']:.2f} s, decoding the iPad's {per_pass['decode']:.2f} s", flush=True)
+    print("iPad share per chunk: " + " ".join(f"{share:.0%}" for share in shares), flush=True)
+    if args.split_only:
+        assist.detach()
+        return
     assist.detach()
     print("Mac alone again", flush=True)
     again, again_times = generate(pipe, image, prompt, trajectory)
