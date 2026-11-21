@@ -51,7 +51,8 @@ def _worker(rank, config, commands, replies, rendezvous):
         if cuda:
             torch.cuda.reset_peak_memory_stats()
         keys = camera = None
-        # MPS/CPU: encode the next chunk's VAE condition between turns (LINGBOT_DEMO_PREFETCH=0 disables)
+        # MPS/CPU: reply with the frames before the chunk's KV-cache write, then write it and encode
+        # the next chunk's VAE condition between turns (LINGBOT_DEMO_PREFETCH=0 disables both)
         prefetch = not cuda and os.environ.get("LINGBOT_DEMO_PREFETCH", "1") != "0"
         while True:
             request = commands.get()  # No GPU collective is pending during user idle.
@@ -95,7 +96,7 @@ def _worker(rank, config, commands, replies, rendezvous):
                     raise ValueError(f"Unknown camera action: {action}")
                 synchronize(device)
                 start = time.perf_counter()
-                frames = pipe.step(camera.rays(keys.chunk(action)))
+                frames = pipe.step(camera.rays(keys.chunk(action)), defer_cache=prefetch)
                 synchronize(device)
                 model_ms = (time.perf_counter() - start) * 1000
                 if world > 1:
@@ -131,8 +132,9 @@ def _worker(rank, config, commands, replies, rendezvous):
                           "peak_reserved_bytes": reserved}
             replies.put({"rank": rank, "result": result, "memory": memory})
             if prefetch and op in ("start", "step"):
-                # The VAE condition of the next chunk doesn't depend on the action: encode it while
-                # the player decides (MPS: ~4 s per chunk), so the next turn doesn't wait for it.
+                # Neither the cache write (KV refinement, ~0.6 s on MPS) nor the next chunk's VAE
+                # condition (~4 s) depends on the next action: run them while the player decides.
+                pipe.finish_chunk()
                 pipe.prefetch_condition()
             if cuda:
                 torch.cuda.reset_peak_memory_stats()

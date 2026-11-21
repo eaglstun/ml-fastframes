@@ -129,6 +129,7 @@ class FastFramesLingBot:
         decoder_cls = CapturedDecoder if world == 1 else SpatialDecoder
         self.decoder = decoder_cls(decoder, compile=compile, graphs=graphs)
         self.prompt = self.condition = self.noise = self.generator = None
+        self._pending = None  # deferred cache write of the last chunk (``step(..., defer_cache=True)``)
         self.noise_mode = "clip"
         self.latents = self.chunk = 0
 
@@ -178,6 +179,7 @@ class FastFramesLingBot:
         if noise not in ("clip", "chunk"):
             raise ValueError(f"unknown noise mode {noise!r}")
         self.noise_mode = noise
+        self._pending = None
         self.cache_k.zero_()
         self.cache_v.zero_()
         self.decoder.reset()
@@ -211,12 +213,18 @@ class FastFramesLingBot:
                         layer[:, start:end].copy_(layer[:, start + shift:end + shift])
 
     @torch.inference_mode()
-    def step(self, rays):
+    def step(self, rays, *, defer_cache=False):
         """Generate the next chunk for camera ``rays`` (``Trajectory.rays`` / ``LiveCamera.rays``).
 
         Returns ``[16, 464, 832, 3]`` uint8 frames on rank 0 (13 for the first chunk: the pixel
         decoder's first three frames precede the first image) and ``None`` on other ranks.
+
+        The frames don't depend on the chunk's cache write (KV refinement, or the first chunk's
+        clean pass), which only the next chunk reads. ``defer_cache=True`` returns the frames
+        before it; an interactive caller then runs ``finish_chunk()`` while the frames are shown
+        (the next ``step`` runs it first if the caller didn't). Same values either way.
         """
+        self.finish_chunk()
         chunk = self.chunk
         if self.condition is None or chunk >= self.num_chunks:
             raise RuntimeError("no session or horizon reached; call start() or restart()")
@@ -236,16 +244,31 @@ class FastFramesLingBot:
             if i + 1 < len(self.timesteps):
                 noise = torch.randn(x0.shape, device=self.device, dtype=x0.dtype, generator=self.generator)
                 x = self.scheduler.add_noise(x0, noise, self.schedule[i + 1])
+        self._pending = (chunk, x0, y, rope, read_frames)
+        if not defer_cache:
+            self._write_cache()
+        # The clean pass and the refiner write only the cache (``capture=False`` keeps the features)
+        pixels = self.decoder(result.features, result.embedding)
+        self.chunk += 1
+        frames = None if self.rank != 0 else to_uint8(pixels[0, 3:] if chunk == 0 else pixels[0])
+        if not defer_cache:
+            release_mps_cache(self.device)  # MPS: don't let the allocator hoard per-chunk temporaries
+        return frames
+
+    @torch.inference_mode()
+    def finish_chunk(self):
+        """Write the last chunk's KV cache if ``step(..., defer_cache=True)`` left it pending."""
+        if self._pending is not None:
+            self._write_cache()
+            release_mps_cache(self.device)
+
+    def _write_cache(self):
+        chunk, x0, y, rope, read_frames = self._pending
+        self._pending = None
         if chunk == 0:
             self.dit(x0, 0, read_frames, capture=False)  # clean pass writes the first chunk's cache
         else:
             self.refiner(x0, y, rope, read_frames)
-        pixels = self.decoder(result.features, result.embedding)
-        self.chunk += 1
-        release_mps_cache(self.device)  # MPS: don't let the allocator hoard per-chunk temporaries
-        if self.rank != 0:
-            return None
-        return to_uint8(pixels[0, 3:] if chunk == 0 else pixels[0])
 
     def close(self):
         """Release CUDA graphs (call on every rank before destroying the process group)."""
