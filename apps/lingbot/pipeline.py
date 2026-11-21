@@ -100,6 +100,10 @@ class FastFramesLingBot:
         if world not in (1, 8):
             raise ValueError("FastFrames-LingBot runs on 1 or 8 GPUs")
         self.model, self.upstream, self.world, self.rank = model, upstream, world, rank
+        # Everything that doesn't depend on the frame size, to build a pipeline at another size
+        # (``parts``) without reloading weights.
+        self._parts = dict(model=model, upstream=upstream, refiner=refiner, decoder=decoder, world=world, rank=rank,
+                           compile=compile, graphs=graphs)
         dit = upstream.dit
         self.device = dit.patch_embedding.weight.device
         scheduler = upstream.scheduler
@@ -288,6 +292,11 @@ class FastFramesLingBot:
             self.dit(x0, 0, read_frames, capture=False)  # clean pass writes the first chunk's cache
         else:
             self.refiner(x0, y, rope, read_frames)
+
+    def parts(self):
+        """Constructor arguments sharing this pipeline's weights: after ``close()`` and
+        ``conditioning.set_size``, ``FastFramesLingBot(**parts)`` is a pipeline at the new size."""
+        return dict(self._parts)
 
     def close(self):
         """Release CUDA graphs (call on every rank before destroying the process group)."""

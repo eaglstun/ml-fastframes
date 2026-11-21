@@ -40,6 +40,16 @@ STATIC = Path(__file__).with_name("static")
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP")  # decoders allowed for uploaded images
 DEFAULT_SIZE = (832, 464)  # LingBot's trained frame size (width, height)
+# Sizes a visitor can pick per session on a Mac (one device, eager): the worker rebuilds the
+# size-dependent buffers around the loaded weights. CUDA keeps its single, warmed-up size.
+SESSION_SIZES = ((832, 464), (576, 320), (416, 240))
+
+
+def session_sizes(default, gpus):
+    """``default`` first, then the other per-session sizes where switching is supported."""
+    if gpus != 1 or sys.platform != "darwin":
+        return [tuple(default)]
+    return [tuple(default)] + [size for size in SESSION_SIZES if size != tuple(default)]
 
 
 def parse_size(text):
@@ -88,7 +98,18 @@ def prepare_image(raw, size=DEFAULT_SIZE):
         raise ValueError("Could not read this image; use JPEG, PNG or WebP") from exc
 
 
-def start_arguments(payload, examples, size=DEFAULT_SIZE):
+def start_arguments(payload, examples, size=DEFAULT_SIZE, sizes=None):
+    """Validated start request; ``size``: the default, ``sizes``: what a visitor may choose."""
+    requested = payload.get("size")
+    if requested is not None:
+        sizes = [tuple(s) for s in (sizes or [size])]
+        try:
+            width, height = (int(v) for v in str(requested).lower().split("x"))
+        except ValueError:
+            raise ValueError("Choose one of the offered frame sizes") from None
+        if (width, height) not in sizes:
+            raise ValueError("Choose one of the offered frame sizes")
+        size = (width, height)
     prompt = payload.get("prompt", "")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 1600:
         raise ValueError("Enter a prompt of 1–1600 characters")
@@ -113,7 +134,7 @@ def start_arguments(payload, examples, size=DEFAULT_SIZE):
         if not isinstance(example, str) or example not in examples:
             raise ValueError("Choose an example or upload a start image")
         raw = examples[example]["path"].read_bytes()
-    return {"prompt": prompt.strip(), "seed": seed, "image": prepare_image(raw, size)}
+    return {"prompt": prompt.strip(), "seed": seed, "image": prepare_image(raw, size), "size": list(size)}
 
 
 @dataclass
@@ -161,8 +182,10 @@ class DemoApplication:
         room = self.waiting_room
         room.connect(connection_id, websocket)
         try:
-            await self._send(websocket, {"type": "hello", "gpus": self.pool.config["gpus"],
-                                         "ready": self.pool.ready})
+            config = self.pool.config
+            sizes = [list(size) for size in config.get("sizes") or [config.get("size", DEFAULT_SIZE)]]
+            await self._send(websocket, {"type": "hello", "gpus": config["gpus"], "ready": self.pool.ready,
+                                         "sizes": sizes})
             await self._send(websocket, room.state(connection_id))
             async for raw in websocket:
                 try:
@@ -184,7 +207,8 @@ class DemoApplication:
         room = self.waiting_room
         if kind == "start":
             # Validate before reserving the GPU; private inputs aren't broadcast.
-            args = start_arguments(payload, self.examples, self.pool.config.get("size", DEFAULT_SIZE))
+            config = self.pool.config
+            args = start_arguments(payload, self.examples, config.get("size", DEFAULT_SIZE), config.get("sizes"))
             await room.start(websocket, connection_id, args)
         elif kind == "join_queue":
             await room.join(connection_id)
@@ -421,6 +445,7 @@ def main():
     args = parser.parse_args()
     if args.size != DEFAULT_SIZE and args.gpus != 1:
         parser.error("--size other than 832x464 was only tried on one device")
+    args.sizes = session_sizes(args.size, args.gpus)  # offered to visitors; --size is the default
     if not args.lingbot_root or not Path(args.lingbot_root, "wan", "modules", "model_fast.py").is_file():
         parser.error("set LINGBOT_WORLD_ROOT or --lingbot-root to the pinned upstream clone "
                      "(see docs/lingbot.md)")

@@ -12,7 +12,10 @@
 type Action = "idle" | "forward" | "backward" | "left" | "right" | "yaw_left" | "yaw_right";
 type Access = "owner" | "queued" | "busy" | "available";
 
-interface HelloMessage { type: "hello"; gpus: number; ready: boolean }
+interface HelloMessage {
+  type: "hello"; gpus: number; ready: boolean;
+  sizes?: [number, number][];  // frame sizes a visitor may choose, the server's default first
+}
 interface QueueStateMessage {
   type: "queue_state"; enabled: boolean; status: Access; position: number | null;
   waiting_count: number; idle_remaining_seconds: number | null; idle_timeout_seconds: number;
@@ -35,7 +38,7 @@ type ServerMessage = HelloMessage | QueueStateMessage | SessionMessage | StatusM
   | PreviewMessage | ErrorMessage;
 
 type ClientMessage =
-  | { type: "start"; prompt: string; seed: number; image?: string; example?: string }
+  | { type: "start"; prompt: string; seed: number; image?: string; example?: string; size?: string }
   | { type: "stop" } | { type: "activity" } | { type: "join_queue" } | { type: "leave_queue" }
   | { type: "action"; action: Action; request_id: string }
   | { type: "displayed"; chunk_index: number };
@@ -90,6 +93,9 @@ const ui = {
   imagePreview: byId("imagePreview", HTMLImageElement),
   imagePlaceholder: byId("imagePlaceholder", HTMLDivElement),
   imageName: byId("imageName", HTMLElement),
+  sizeField: byId("sizeField", HTMLDivElement),
+  sizeToggle: byId("sizeToggle", HTMLDivElement),
+  sizeHint: byId("sizeHint", HTMLParagraphElement),
 };
 
 // ------------------------------------------------------------------ state
@@ -117,6 +123,8 @@ const state = {
   sequence: 0, epoch: 0, frames: 0, chunks: 0, image: null as string | null,
   examples: [] as Example[], requestTimes: new Map<string, number>(), metadata: [] as ChunkMessage[],
   frameURL: null as string | null, cancelLoad: null as (() => void) | null, lastActivity: -Infinity,
+  sizes: [] as string[], size: null as string | null,  // "WxH"; null: the server's default
+  sessionSize: null as string | null,  // the size of the world being explored
 };
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -156,6 +164,7 @@ function updateControls(): void {
   ui.transportLight.classList.toggle("active", state.active);
   ui.takeDot.classList.toggle("active", state.active);
   ui.takeLabel.textContent = state.preparing ? "PREPARING" : state.active ? "LIVE WORLD" : "STANDBY";
+  updateSizeHint();
 }
 
 function clearHeld(): void {
@@ -201,6 +210,70 @@ function activity(): void {
   }
 }
 
+// ------------------------------------------------------------------ frame size
+
+// Relative speed per chunk measured on an M4 Max (MAC.md); only 832x464 is the trained size.
+const SIZE_INFO: Partial<Record<string, { name: string; note: string; hint: string }>> = {
+  "832x464": { name: "Full", note: "832 × 464", hint: "The size the model was trained at: best quality, slowest turns." },
+  "576x320": { name: "Fast", note: "576 × 320", hint: "~4× faster turns. Softer detail; the world stays coherent." },
+  "416x240": { name: "Quarter", note: "416 × 240", hint: "~8× faster turns. Out of the model's range: scenes melt within a few turns." },
+};
+const SIZE_KEY = "lingbot.size";
+
+function sizeInfo(size: string): { name: string; note: string; hint: string } {
+  return SIZE_INFO[size] ?? { name: size.replace("x", " × "), note: "custom size", hint: "" };
+}
+
+function storedSize(): string | null {
+  try { return window.localStorage.getItem(SIZE_KEY); } catch { return null; }
+}
+
+function storeSize(size: string): void {
+  try { window.localStorage.setItem(SIZE_KEY, size); } catch { /* private mode: not remembered */ }
+}
+
+function updateSizeHint(): void {
+  const size = state.size;
+  if (!size) { ui.sizeHint.textContent = ""; return; }
+  const applies = state.active && state.sessionSize !== null && state.sessionSize !== size;
+  ui.sizeHint.textContent = applies ? `${sizeInfo(size).hint} Applies when you restart the world.` : sizeInfo(size).hint;
+}
+
+function selectSize(size: string): void {
+  state.size = size;
+  storeSize(size);
+  for (const button of ui.sizeToggle.querySelectorAll<HTMLButtonElement>("button")) {
+    button.setAttribute("aria-checked", String(button.dataset.size === size));
+  }
+  updateSizeHint();
+  activity();
+}
+
+function renderSizes(sizes: [number, number][] | undefined): void {
+  state.sizes = (sizes ?? []).map(([width, height]) => `${width}x${height}`);
+  ui.sizeField.hidden = state.sizes.length < 2;
+  ui.sizeToggle.replaceChildren(...state.sizes.map((size) => {
+    const info = sizeInfo(size);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.size = size;
+    button.setAttribute("role", "radio");
+    button.title = info.hint;
+    const name = document.createElement("strong");
+    name.textContent = info.name;
+    const note = document.createElement("small");
+    note.textContent = info.note;
+    button.append(name, note);
+    button.addEventListener("click", () => selectSize(size));
+    return button;
+  }));
+  const stored = storedSize();
+  const first = state.sizes[0];
+  if (stored !== null && state.sizes.includes(stored)) selectSize(stored);
+  else if (first !== undefined) selectSize(first);
+  else state.size = null;
+}
+
 // ------------------------------------------------------------------ session
 
 function start(): void {
@@ -225,7 +298,11 @@ function start(): void {
   ui.chunkCount.textContent = "0";
   ui.actionReadout.textContent = "Preparing your world";
   ui.toast.hidden = true;
-  send(state.image ? { type: "start", prompt, seed, image: state.image } : { type: "start", prompt, seed, example });
+  const size = state.sizes.length > 1 && state.size !== null ? { size: state.size } : {};
+  send(state.image ? { type: "start", prompt, seed, image: state.image, ...size }
+    : { type: "start", prompt, seed, example, ...size });
+  state.sessionSize = state.size;
+  updateSizeHint();
   status("Preparing your world…");
   updateControls();
 }
@@ -453,6 +530,7 @@ function handleMessage(message: ServerMessage): void {
     case "hello":
       state.ready = Boolean(message.ready);
       ui.gpuLabel.textContent = `${message.gpus} GPU${message.gpus === 1 ? "" : "s"}`;
+      renderSizes(message.sizes);
       status(state.ready ? "Ready · set the scene and start your world" : "Ready · first start warms up the model");
       updateControls();
       break;

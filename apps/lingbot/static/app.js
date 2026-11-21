@@ -53,6 +53,9 @@ const ui = {
     imagePreview: byId("imagePreview", HTMLImageElement),
     imagePlaceholder: byId("imagePlaceholder", HTMLDivElement),
     imageName: byId("imageName", HTMLElement),
+    sizeField: byId("sizeField", HTMLDivElement),
+    sizeToggle: byId("sizeToggle", HTMLDivElement),
+    sizeHint: byId("sizeHint", HTMLParagraphElement),
 };
 // ------------------------------------------------------------------ state
 const FRAME_MS = 1000 / 50;
@@ -74,6 +77,8 @@ const state = {
     sequence: 0, epoch: 0, frames: 0, chunks: 0, image: null,
     examples: [], requestTimes: new Map(), metadata: [],
     frameURL: null, cancelLoad: null, lastActivity: -Infinity,
+    sizes: [], size: null, // "WxH"; null: the server's default
+    sessionSize: null, // the size of the world being explored
 };
 let toastTimer;
 function buttonAction(button) {
@@ -107,6 +112,7 @@ function updateControls() {
     ui.transportLight.classList.toggle("active", state.active);
     ui.takeDot.classList.toggle("active", state.active);
     ui.takeLabel.textContent = state.preparing ? "PREPARING" : state.active ? "LIVE WORLD" : "STANDBY";
+    updateSizeHint();
 }
 function clearHeld() {
     state.held = null;
@@ -149,6 +155,76 @@ function activity() {
         state.lastActivity = now;
     }
 }
+// ------------------------------------------------------------------ frame size
+// Relative speed per chunk measured on an M4 Max (MAC.md); only 832x464 is the trained size.
+const SIZE_INFO = {
+    "832x464": { name: "Full", note: "832 × 464", hint: "The size the model was trained at: best quality, slowest turns." },
+    "576x320": { name: "Fast", note: "576 × 320", hint: "~4× faster turns. Softer detail; the world stays coherent." },
+    "416x240": { name: "Quarter", note: "416 × 240", hint: "~8× faster turns. Out of the model's range: scenes melt within a few turns." },
+};
+const SIZE_KEY = "lingbot.size";
+function sizeInfo(size) {
+    return SIZE_INFO[size] ?? { name: size.replace("x", " × "), note: "custom size", hint: "" };
+}
+function storedSize() {
+    try {
+        return window.localStorage.getItem(SIZE_KEY);
+    }
+    catch {
+        return null;
+    }
+}
+function storeSize(size) {
+    try {
+        window.localStorage.setItem(SIZE_KEY, size);
+    }
+    catch { /* private mode: not remembered */ }
+}
+function updateSizeHint() {
+    const size = state.size;
+    if (!size) {
+        ui.sizeHint.textContent = "";
+        return;
+    }
+    const applies = state.active && state.sessionSize !== null && state.sessionSize !== size;
+    ui.sizeHint.textContent = applies ? `${sizeInfo(size).hint} Applies when you restart the world.` : sizeInfo(size).hint;
+}
+function selectSize(size) {
+    state.size = size;
+    storeSize(size);
+    for (const button of ui.sizeToggle.querySelectorAll("button")) {
+        button.setAttribute("aria-checked", String(button.dataset.size === size));
+    }
+    updateSizeHint();
+    activity();
+}
+function renderSizes(sizes) {
+    state.sizes = (sizes ?? []).map(([width, height]) => `${width}x${height}`);
+    ui.sizeField.hidden = state.sizes.length < 2;
+    ui.sizeToggle.replaceChildren(...state.sizes.map((size) => {
+        const info = sizeInfo(size);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset.size = size;
+        button.setAttribute("role", "radio");
+        button.title = info.hint;
+        const name = document.createElement("strong");
+        name.textContent = info.name;
+        const note = document.createElement("small");
+        note.textContent = info.note;
+        button.append(name, note);
+        button.addEventListener("click", () => selectSize(size));
+        return button;
+    }));
+    const stored = storedSize();
+    const first = state.sizes[0];
+    if (stored !== null && state.sizes.includes(stored))
+        selectSize(stored);
+    else if (first !== undefined)
+        selectSize(first);
+    else
+        state.size = null;
+}
 // ------------------------------------------------------------------ session
 function start() {
     if (ui.startButton.disabled)
@@ -182,7 +258,11 @@ function start() {
     ui.chunkCount.textContent = "0";
     ui.actionReadout.textContent = "Preparing your world";
     ui.toast.hidden = true;
-    send(state.image ? { type: "start", prompt, seed, image: state.image } : { type: "start", prompt, seed, example });
+    const size = state.sizes.length > 1 && state.size !== null ? { size: state.size } : {};
+    send(state.image ? { type: "start", prompt, seed, image: state.image, ...size }
+        : { type: "start", prompt, seed, example, ...size });
+    state.sessionSize = state.size;
+    updateSizeHint();
     status("Preparing your world…");
     updateControls();
 }
@@ -439,6 +519,7 @@ function handleMessage(message) {
         case "hello":
             state.ready = Boolean(message.ready);
             ui.gpuLabel.textContent = `${message.gpus} GPU${message.gpus === 1 ? "" : "s"}`;
+            renderSizes(message.sizes);
             status(state.ready ? "Ready · set the scene and start your world" : "Ready · first start warms up the model");
             updateControls();
             break;

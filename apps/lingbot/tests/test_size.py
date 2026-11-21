@@ -64,5 +64,41 @@ class SizeTests(unittest.TestCase):
         self.assertEqual(demo_parse_size("416x240"), (416, 240))
 
 
+class SessionSizeTests(unittest.TestCase):
+    def payload(self, **extra):
+        import base64
+        import io
+
+        from PIL import Image
+        source = io.BytesIO()
+        Image.new("RGB", (900, 500), "#173c30").save(source, format="PNG")
+        return {"prompt": "A quiet forest", "seed": 0,
+                "image": "data:image/png;base64," + base64.b64encode(source.getvalue()).decode(), **extra}
+
+    def test_offered_sizes(self):
+        import sys
+
+        from apps.lingbot.demo import session_sizes
+        self.assertEqual(session_sizes((832, 464), 8), [(832, 464)])
+        if sys.platform == "darwin":
+            self.assertEqual(session_sizes((576, 320), 1), [(576, 320), (832, 464), (416, 240)])
+
+    def test_a_visitor_can_pick_only_an_offered_size(self):
+        import io
+
+        from PIL import Image
+        sizes = [(832, 464), (576, 320), (416, 240)]
+        args = start_arguments(self.payload(size="576x320"), {}, (832, 464), sizes)
+        self.assertEqual(args["size"], [576, 320])
+        with Image.open(io.BytesIO(args["image"])) as image:
+            self.assertEqual(image.size, (576, 320))
+        self.assertEqual(start_arguments(self.payload(), {}, (832, 464), sizes)["size"], [832, 464])
+        for size in ("640x360", "576x320x1", "big", 576):
+            with self.assertRaises(ValueError):
+                start_arguments(self.payload(size=size), {}, (832, 464), sizes)
+        with self.assertRaises(ValueError):  # a server offering one size accepts only that one
+            start_arguments(self.payload(size="576x320"), {}, (832, 464), None)
+
+
 if __name__ == "__main__":
     unittest.main()

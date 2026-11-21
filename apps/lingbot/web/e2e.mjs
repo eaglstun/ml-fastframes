@@ -116,6 +116,36 @@ try {
   log("state:", JSON.stringify(await evaluate(ui)));
   await shot("4_after_d.png");
 
+  // Frame-size toggle (offered on a Mac): restart at each other size and play turns there.
+  const sizes = await evaluate(`[...document.querySelectorAll("#sizeToggle button")].map((b) => b.dataset.size)`);
+  log("sizes offered:", sizes.join(", ") || "one (toggle hidden)");
+  const pressW = async () => {
+    const key = { code: "KeyW", key: "w", windowsVirtualKeyCode: 87, nativeVirtualKeyCode: 87 };
+    await cdp("Input.dispatchKeyEvent", { type: "keyDown", ...key, text: "w" });
+    await sleep(60);
+    await cdp("Input.dispatchKeyEvent", { type: "keyUp", ...key });
+  };
+  const chunks = async () => Number(await evaluate(`document.getElementById("chunkCount").textContent`));
+  const idle = `document.getElementById("keyboardStatus").textContent === "KEYBOARD LIVE" && !document.getElementById("stateLabel").textContent.startsWith("Generating")`;
+  for (const [size, turns] of [["576x320", 1], ["416x240", 10]]) {
+    if (!sizes.includes(size)) continue;
+    await evaluate(`document.querySelector('#sizeToggle button[data-size="${size}"]').click()`);
+    log(`selected ${size}; hint: ${await evaluate(`document.getElementById("sizeHint").textContent`)}`);
+    await evaluate(`document.getElementById("startButton").click()`);
+    log("clicked Restart world");
+    await until(`first chunk at ${size}`, `document.getElementById("chunkCount").textContent === "1" && ${idle}`, 180000, watchPreview);
+    const label = await evaluate(`document.getElementById("resolutionLabel").textContent`);
+    if (label !== size.replace("x", " × ")) throw new Error(`resolution label ${label} at ${size}`);
+    for (let turn = 1; turn <= turns; turn++) {
+      const before = await chunks();
+      await pressW();  // immediately, no think time: measures any wait for between-turn work
+      await until(`${size} turn ${turn}`, `Number(document.getElementById("chunkCount").textContent) > ${before} && ${idle}`, 120000, watchPreview);
+      const s = await evaluate(ui);
+      log(`  ${size} turn ${turn}: input -> first frame ${s.total}, model ${s.model}, non-model ${s.other}`);
+    }
+    await shot(`5_${size}.png`);
+  }
+
   await evaluate(`document.getElementById("stopButton").click()`);
   await until("session stopped", `!document.getElementById("startButton").disabled && document.getElementById("startButtonLabel").textContent === "Start world"`, 30000);
   log("final:", JSON.stringify(await evaluate(ui)));

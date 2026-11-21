@@ -144,7 +144,12 @@ memory (a 576x320 run peaks at ~13 GB).
 
 `generate.py`, `latency.py` and `demo.py` take `--size WxH` (multiples of 16, one device). Only
 832x464 is what LingBot and the FastFrames refiner/decoder were trained at, so smaller sizes trade
-fidelity for speed. Example 00, seed 0, same camera path, M4 Max:
+fidelity for speed. On a Mac the demo page also has a **frame size** toggle (Full 832x464, Fast
+576x320, Quarter 416x240; `--size` picks the default): the worker rebuilds the size-dependent
+buffers around the loaded weights when a world starts at another size, freeing the old ones first.
+Restarting at a new size took ~13 s (576x320) and ~7 s (416x240) to the first chunk, including
+re-encoding the prompt. Quarter-size demo turns took 2.6-3.6 s. Example 00, seed 0, same camera
+path, M4 Max:
 
 | size    | tokens/frame | full-cache chunk (`generate`-style, condition inline) | demo turn (5 s think time)          | look                                                                                |
 | ------- | ------------ | ----------------------------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------- |
@@ -288,6 +293,15 @@ is an A/B measured back to back or interleaved, not an absolute benchmark.
   preview, so the frames are byte-identical with previews off (141/141 demo frames). Each preview
   costs one pixel decode (~0.25 s), below the run-to-run noise of a turn. `LINGBOT_DEMO_PREVIEW=0`
   disables them (MPS/CPU, one device).
+- **The image condition stops costing anything after chunk 8** (`LazyImageCondition`). After the
+  first image the condition encodes black frames, and the causal VAE encoder converges: latents are
+  bit-identical from latent 30 on at all three sizes. Once a new latent *and* the encoder's whole
+  feature cache repeat the previous step bit for bit, the encoder is at a fixed point, and later
+  latents are reused without encoding (exactly the same values: 15 chunks with and without the
+  shortcut are bit-identical at 832x464, 576x320 and 416x240). From chunk 8 the condition costs
+  0 s instead of 4.19 / 2.45 / 1.32 s per chunk. That was the work a quick key press waited for
+  between turns: in a quarter-size session with no pause between turns, the input-to-frame time
+  outside the model went from 0.6-1.0 s (turns 1-7) to 8-10 ms (turns 8-10).
 
 What's left in a full-cache LingBot chunk is mostly attention (~60%) and GEMMs, which run at
 12.4-14.2 TFLOPS (MPS's own matmul), close to what this GPU does.

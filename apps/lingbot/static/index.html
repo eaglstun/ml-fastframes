@@ -71,6 +71,7 @@
           <select id="exampleSelect" aria-label="Example starting image"><option value="">Loading examples…</option></select>
           <label class="field-label prompt-label" for="promptInput">PROMPT</label>
           <div class="prompt-box"><textarea id="promptInput" rows="4" maxlength="1600" placeholder="Describe the world you want to explore…"></textarea><span class="prompt-footer"><span><kbd>Ctrl / ⌘</kbd> <kbd>↵</kbd> to start</span><span id="promptCount">0 / 1600</span></span></div>
+          <div class="size-field" id="sizeField" hidden><span class="field-label">FRAME SIZE</span><div class="size-toggle" id="sizeToggle" role="radiogroup" aria-label="Frame size"></div><p class="size-hint" id="sizeHint"></p></div>
           <div class="session-row"><label class="seed-field" for="seedInput"><span>SEED</span><input id="seedInput" type="number" min="0" max="4294967295" step="1" value="42" /><button id="randomSeedButton" type="button" aria-label="Randomize seed" title="Randomize seed">↻</button></label><button class="primary-button" id="startButton" type="button" disabled><span aria-hidden="true">▶</span><span id="startButtonLabel">Start world</span></button><button class="stop-button" id="stopButton" type="button" aria-label="Stop session" title="Stop session" disabled><span aria-hidden="true">■</span></button></div>
         </section>
 
