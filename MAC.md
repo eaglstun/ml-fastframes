@@ -326,7 +326,7 @@ remote stage) can't help: the passes are sequential, so one device always waits.
 chunk's *tokens* (upstream LingBot's 8-GPU layout: each rank runs every layer on its share and
 the ranks exchange K/V once per layer) runs both at once. `scripts/bench_dit_block.py` times one
 DiT block at the demo's shapes; the same benchmark runs on the iPad as `DiTBench.swift` in the
-exo-ipad-spike app.
+[exo-touch](https://github.com/eaglstun/exo-touch) app.
 
 | per block | M4 Max, PyTorch MPS (today) | M4 Max, MLX | iPad Pro 11" M5, MLX |
 |---|---|---|---|
@@ -366,7 +366,7 @@ it needs the block in MLX-Swift (`lingbot_block_mlx.py` is the reference), a K/V
 and the refined cache sent to the iPad between turns.
 
 **Built: the iPad shares LingBot's DiT** (`apps/lingbot/ipad.py` here, `SplitStage.swift` in
-exo-ipad-spike, `demo.py --ipad <its USB address>`). Every denoising pass's chunk tokens are split;
+exo-touch, `demo.py --ipad <its USB address>`). Every denoising pass's chunk tokens are split;
 in each block both sides swap their tokens' canonical (pre-RoPE) keys and values, rotate the other's,
 and attend over the whole cache, so this Mac also holds every token's canonical K/V for the KV
 refiner. The iPad mirrors the cache: the weights once (2.6 GB in ~3.7 s, footprint 8.2 GB), the
@@ -393,7 +393,7 @@ alone; at 576x320 and 416x240 the exchange costs more than the iPad saves (4.6 v
 **Why 1.26x and not ~1.5x: the iPad's GPU throttles under sustained load.** It holds benchmark
 speed for ~20-27 s of continuous GPU work, then drops to ~0.5-0.6x and stays there; ~30 s idle
 buys back ~10 s of full speed (hence the faster first turns in the demo, which idles between
-turns). exo-ipad-spike's `mac/split_fake_mac.py` drives the iPad's side with random weights and no
+turns). exo-touch's `mac/split_fake_mac.py` drives the iPad's side with random weights and no
 Mac model: with no traffic at all (`--solo`) a 2960-token pass over 27144 cache rows goes from 2.5 s
 to 4.0-4.4 s after the eighth pass, at 6032 or 27144 rows and at 5.4 or 9.3 GB footprint alike;
 the exchange adds ~20% on top only once throttled (4.9 s; a real session 5.0-5.3 s). The iPad's

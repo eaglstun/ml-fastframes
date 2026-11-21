@@ -4,7 +4,8 @@
 #
 """Share LingBot's DiT with an iPad (or another Apple device) by tokens, over a socket.
 
-The iPad runs SplitStage.swift from the exo-ipad-spike app (MLX-Swift, `SPIKE_MODE=split`). Each
+The iPad runs SplitStage.swift from the exo-touch app (MLX-Swift, github.com/eaglstun/exo-touch,
+`SPIKE_MODE=split`). Each
 denoising pass's chunk tokens are split: this Mac keeps [0, n), the iPad runs [n, tokens) through
 all 30 blocks. In every block both sides compute their tokens' keys and values, swap the canonical
 (pre-RoPE) ones, rotate the other side's with the chunk's RoPE table, write both into their own KV
