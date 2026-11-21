@@ -319,6 +319,32 @@ is an A/B measured back to back or interleaved, not an absolute benchmark.
 What's left in a full-cache LingBot chunk is mostly attention (~60%) and GEMMs, which run at
 12.4-14.2 TFLOPS (MPS's own matmul), close to what this GPU does.
 
+## Splitting a chunk with an iPad (measured, not built)
+
+Could an iPad Pro share the DiT's work over a cable? Splitting *layers* between devices (exo's
+remote stage) can't help: the passes are sequential, so one device always waits. Splitting a
+chunk's *tokens* (upstream LingBot's 8-GPU layout: each rank runs every layer on its share and
+the ranks exchange K/V once per layer) runs both at once. `scripts/bench_dit_block.py` times one
+DiT block at the demo's shapes; the same benchmark runs on the iPad as `DiTBench.swift` in the
+exo-ipad-spike app.
+
+| per block | M4 Max, PyTorch MPS (today) | M4 Max, MLX | iPad Pro 11" M5, MLX |
+|---|---|---|---|
+| 832x464 | 174.8 ms | 124.4 ms | 160.4 ms |
+| 576x320 | 39.5 ms | 39.2 ms | 50.2 ms |
+| 416x240 | 17.7 ms | 17.7 ms | 22.9 ms |
+
+The M5's GPU matrix units put it within ~10-25% of the M4 Max. The link is the limit: an iPad
+joins a Mac as a USB network device at 10 Gb/s (858 MB/s measured, 0.29 ms round trip), not over
+Thunderbolt networking. Each layer of each pass exchanges the chunk's K/V (~37 MB at 832x464), so
+at 832x464 with half the tokens on the iPad a chunk's DiT would take roughly 120 x (87 ms compute +
+~22 ms transfer) = ~13 s instead of ~21 s, more if transfers overlap compute. At 576x320 the
+gain shrinks to ~1.2-1.5x and at 416x240 the transfers cancel it. Building it needs the Wan /
+LingBot block in MLX-Swift, a K/V exchange per layer, and the refined cache sent to the iPad
+between turns. The whole-block times also suggest MLX runs this block ~1.4x faster than PyTorch
+MPS on the Mac at 832x464 (mostly the non-GEMM glue); the benchmark concatenates the cache, which
+the real DiT writes in place, so that gap needs checking on the real model.
+
 ## What was changed for FastFrames-S (see `git diff`)
 
 | Problem on Mac                                                                                                                                                          | Fix                                                                                                                                        |
