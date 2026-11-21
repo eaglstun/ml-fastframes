@@ -400,10 +400,41 @@ the exchange adds ~20% on top only once throttled (4.9 s; a real session 5.0-5.3
 `thermalState` stays nominal, thermal pressure 0, a fixed CPU loop steady and the battery full
 throughout, so iOS doesn't report it; nothing in software moved it (zero-copy sockets, idling the
 GPU between passes). The adaptive split absorbs it by moving tokens back to the Mac (the 38-55%
-shares above). What's left: cooling the iPad, cheaper attention on it, and hiding the K/V
-exchange (each side waits for the other's 12 MB per block) by attending over cached rows while the
-other side's are in flight and merging with a log-sum-exp, which neither the Metal flash kernel here
-nor MLX's attention returns yet.
+shares above). What's left: cooling the iPad, or cheaper attention on it.
+
+**Hiding the K/V exchange (built; neutral).** Both sides now attend over the cache's older rows while
+the other side's K/V are in flight, then over this chunk's rows, and merge the two by their
+log-sum-exp (on by default; `lingbot_ipad_split.py --no-overlap` for the old order). Here that's
+`flash_attention_lse` (the Metal kernel writing each row's log-sum-exp and an FP32 output) and
+`merge_attention`: as close to an FP32 reference as one call (1.66e-3) at the same cost. On the iPad,
+MLX computes the log-sum-exp in its fused attention for training only; exo-touch patches mlx-swift to
+expose it (1.34e-3 against PyTorch on the real block, 1.24e-3 in one call). Full-cache chunks: 19.62 s
+split with it, 19.77 s without (1.25x / 1.17x against the Mac alone in each run: within the
+run-to-run noise). Attention over the older rows was never the critical path. Each side's next K/V
+need the other's previous ones, so every block waits on the transfer both ways plus the rest of the
+other side's block (projections, cross-attention, FFN, next QKV); the overlap just turns the iPad's
+waiting into attention.
+
+That exchange takes ~60-70 ms per block both ways (each side's send-to-receive time minus the
+other's turnaround; `lingbot_ipad_split.py` prints it), and it's mostly bytes: a ~24 MB Mac K/V frame
+spends 28.6 ms in `sendall`, the link's 858 MB/s, and the iPad's ~13 MB about 23 ms. Sending the
+tensors' bytes in place instead of joined copies changed nothing (72 -> 70.5 ms). `--kv-bits 8`
+sends int8 per token and head with an FP32 scale (51.6% of the bytes; each side keeps its own K/V
+exact): the frames match the 16-bit split's PSNR chunk for chunk, but its one world run was
+dominated by the iPad throttling (the iPad never waited) and showed no gain, so it stays opt-in.
+Split timings swing ~10% with how hot the iPad is, more than 8-bit could win; a cooled iPad is the
+way to measure it.
+
+Two PyTorch 2.9 MPS traps found on the way (both handled in `apps/lingbot/ipad.py`):
+- A non-blocking copy of a **non-contiguous** MPS tensor to the CPU comes back wrong (10 of 10
+  tries). V, a slice of the fused QKV output, reached the iPad as garbage and every frame after
+  chunk 0 went black. `.contiguous()` first.
+- `torch.mps.Event.synchronize()` and `torch.mps.synchronize()` **hold the GIL** while they wait (a
+  second thread drops from 54M to 2M iterations/s; `.cpu()` releases it), stalling a sender thread.
+  Poll `event.query()` with short sleeps instead. Also: PyTorch MPS commits queued kernels only at a
+  sync, so work queued before Python blocks on a socket doesn't start (`Event().record()` commits
+  without waiting), and `.to("mps")` from the CPU waits for every queued kernel (111.6 ms behind a
+  busy queue, 0.4 ms idle).
 
 ## What was changed for FastFrames-S (see `git diff`)
 
