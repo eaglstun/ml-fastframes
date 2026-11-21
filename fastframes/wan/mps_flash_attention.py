@@ -33,7 +33,7 @@ import math
 
 import torch
 
-__all__ = ["flash_attention", "is_available"]
+__all__ = ["flash_attention", "flash_attention_lse", "merge_attention", "is_available"]
 
 _SRC = r"""
 #include <metal_stdlib>
@@ -64,16 +64,17 @@ kernel void probe_mapping(device float* out, const device float* in,
     out[lane] = (f.x == in[fr * 8 + fc] && f.y == in[fr * 8 + fc + 1]) ? 1.0f : 0.0f;
 }
 
-// q: [B, Lq, H, D], k/v: [B, Lk, H, D], out: [B, Lq, H, D]; all bfloat, contiguous.
+// q: [B, Lq, H, D], k/v: [B, Lk, H, D] bfloat, contiguous; out: [B, Lq, H, D] (OT);
+// flash_attn_lse also writes each row's natural-log sum of exp(scores), lse: [B, Lq, H] float.
 // Grid: x = 32 * ceil(Lq / (8*RT)) threads (threadgroup = 32 = one SIMD-group), y = B*H.
-kernel void flash_attn(device bfloat* out,
+kernel void %(NAME)s(device %(OT)s* out,
                        const device bfloat* q,
                        const device bfloat* k,
                        const device bfloat* v,
                        constant long& Lq_,
                        constant long& Lk_,
                        constant float& scale,   // includes log2(e): the softmax uses exp2
-                       uint3 tg [[threadgroup_position_in_grid]],
+%(LSE_ARG)s                       uint3 tg [[threadgroup_position_in_grid]],
                        ushort lane [[thread_index_in_simdgroup]]) {
     const uint Lq = uint(Lq_), Lk = uint(Lk_);
     const uint fr = ((lane >> 4) << 2) + ((lane >> 1) & 3);
@@ -82,7 +83,7 @@ kernel void flash_attn(device bfloat* out,
     const device bfloat* qh = q + (ulong(b) * Lq * H + h) * D;
     const device bfloat* kh = k + (ulong(b) * Lk * H + h) * D;
     const device bfloat* vh = v + (ulong(b) * Lk * H + h) * D;
-    device bfloat* oh = out + (ulong(b) * Lq * H + h) * D;
+    device %(OT)s* oh = out + (ulong(b) * Lq * H + h) * D;
 
 %(BODY)s}
 """
@@ -166,9 +167,10 @@ def _block(D, H, RT, NK, tail):
     return "".join(f"        {x}\n" for x in o)
 
 
-def _body(D, H, RT, NK):
+def _body(D, H, RT, NK, lse=False, out="bfloat"):
     """Straight-line kernel body: every 8x8 tile is its own named variable and every offset is a
-    literal.  (Indexing arrays of matrices in loops kept them out of registers: 2-4x slower.)"""
+    literal.  (Indexing arrays of matrices in loops kept them out of registers: 2-4x slower.)
+    ``lse`` also writes each row's log-sum-exp; ``out`` is the output's element type."""
     DT, ST = D // 8, H * D
     o = []
     w = o.append
@@ -191,9 +193,12 @@ def _body(D, H, RT, NK):
         w("    lt += simd_shuffle_xor(lt, (ushort)8);")
         w("    inv = 1.0f / lt;")
         w("    {")
-        w(f"        device bfloat* op = oh + ulong(r0 + {i * 8}) * {ST} + fc;")
+        w(f"        device {out}* op = oh + ulong(r0 + {i * 8}) * {ST} + fc;")
         for dc in range(DT):
-            w(f"        ov = FRAG(O{i}_{dc}) * inv; op[{dc * 8}] = bfloat(ov.x); op[{dc * 8 + 1}] = bfloat(ov.y);")
+            w(f"        ov = FRAG(O{i}_{dc}) * inv; op[{dc * 8}] = {out}(ov.x); op[{dc * 8 + 1}] = {out}(ov.y);")
+        if lse:  # m and lt are in base 2 (log2(e) is in ``scale``); one of the row's four lanes writes
+            w(f"        if ((lane & 9) == 0) lse[(ulong(b) * Lq + r0 + {i * 8}) * H + h] = "
+              f"M_LN2_F * (m{i} + log2(lt));")
         w("    }")
     return "\n".join(o) + "\n"
 
@@ -211,11 +216,14 @@ _libs = {}
 _mapping_ok = None
 
 
-def _lib(head_dim, heads, tiling):
-    key = (head_dim, heads, tiling)
+def _lib(head_dim, heads, tiling, lse=False):
+    key = (head_dim, heads, tiling, lse)
     if key not in _libs:
-        _libs[key] = torch.mps.compile_shader(_SRC % {"D": head_dim, "H": heads,
-                                                      "BODY": _body(head_dim, heads, *tiling)})
+        out = "float" if lse else "bfloat"  # the LSE variant's outputs get merged: keep FP32 until then
+        _libs[key] = torch.mps.compile_shader(_SRC % {
+            "D": head_dim, "H": heads, "NAME": "flash_attn_lse" if lse else "flash_attn", "OT": out,
+            "LSE_ARG": "                       device float* lse,\n" if lse else "",
+            "BODY": _body(head_dim, heads, *tiling, lse=lse, out=out)})
     return _libs[key]
 
 
@@ -249,3 +257,31 @@ def flash_attention(q, k, v, scale=None, tiling=None):
     _lib(d, h, tiling).flash_attn(out, q, k, v, lq, lk, scale2,
                                   threads=(32 * groups, b * h, 1), group_size=(32, 1, 1))
     return out
+
+
+def flash_attention_lse(q, k, v, scale=None, tiling=None):
+    """``flash_attention`` over one part of the keys, for merging with another part's
+    (``merge_attention``): returns the FP32 output ``[B, Lq, H, D]`` and each row's natural-log sum
+    of ``exp(scale * q.k)`` over these keys, ``[B, Lq, H]`` FP32."""
+    b, lq, h, d = q.shape
+    lk = k.shape[1]
+    assert q.dtype == k.dtype == v.dtype == torch.bfloat16 and q.device.type == "mps"
+    assert k.shape == v.shape and k.shape[0] == b and k.shape[2:] == (h, d) and d % 8 == 0
+    tiling = tiling or _DEFAULT_TILING
+    assert lq >= 8 * tiling[0] and lk >= 1
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+    lse = torch.empty((b, lq, h), dtype=torch.float32, device=q.device)
+    groups = -(-lq // (8 * tiling[0]))
+    scale2 = float(scale or 1.0 / math.sqrt(d)) * _LOG2E
+    _lib(d, h, tiling, lse=True).flash_attn_lse(out, q, k, v, lq, lk, scale2, lse,
+                                                threads=(32 * groups, b * h, 1), group_size=(32, 1, 1))
+    return out, lse
+
+
+def merge_attention(out_a, lse_a, out_b, lse_b, dtype=torch.bfloat16):
+    """Attention over keys A and B together from each part's output and log-sum-exp: each output
+    weighted by its share of the softmax denominator."""
+    lse = torch.logaddexp(lse_a, lse_b)
+    merged = out_a * torch.exp(lse_a - lse).unsqueeze(-1) + out_b * torch.exp(lse_b - lse).unsqueeze(-1)
+    return merged.to(dtype)

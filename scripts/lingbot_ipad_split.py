@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A FastFrames-LingBot world generated on this Mac alone and with an iPad sharing the DiT's tokens.
 
-The iPad runs SplitStage.swift from the exo-ipad-spike app (`SPIKE_MODE=split`, mac/run_split_stage.sh
+The iPad runs SplitStage.swift from the exo-touch app (`SPIKE_MODE=split`, mac/run_split_stage.sh
 there); apps/lingbot/ipad.py (IPadAssist) is this side. Generates the same world (example 00's camera
 path, seed 0) three times: Mac alone, split with the iPad, Mac alone again. The two Mac-alone runs
 bracket the split one in time (background GPU work moves this Mac's timings) and must be identical.
@@ -60,6 +60,9 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--split-only", action="store_true", help="profile the split run alone (no Mac-alone runs)")
     parser.add_argument("--fixed-share", action="store_true", help="keep --ipad-share for every chunk")
+    parser.add_argument("--kv-bits", type=int, choices=(8, 16), default=16, help="how the K/V cross the link")
+    parser.add_argument("--no-overlap", action="store_true",
+                        help="wait for each block's K/V before attending (the exchange not hidden)")
     parser.add_argument("--no-row-sync", action="store_true",
                         help="diagnostic: don't send the refined rows to the iPad (its frames go wrong)")
     args = parser.parse_args()
@@ -78,7 +81,8 @@ def main():
         print("Mac alone", flush=True)
         alone, alone_times = generate(pipe, image, prompt, trajectory)
     started = time.perf_counter()
-    assist = IPadAssist.attach(pipe, args.ipad, args.port, share=args.ipad_share, adaptive=not args.fixed_share)
+    assist = IPadAssist.attach(pipe, args.ipad, args.port, share=args.ipad_share, adaptive=not args.fixed_share,
+                               overlap=not args.no_overlap, kv_bits=args.kv_bits)
     if args.no_row_sync:
         assist.sync_rows = lambda read_frames: None
     print(f"with the iPad ({1 - assist.n / assist.tokens:.0%} of the tokens; setup "
@@ -88,8 +92,12 @@ def main():
     shares, thermal = assist.stats["shares"], assist.stats["thermal"]
     per_pass = {k: v / max(passes, 1) for k, v in assist.link.timing.items()}
     print(f"per pass on this Mac: encode K/V {per_pass['encode']:.2f} s (GPU sync + copy), waiting on the socket "
-          f"{per_pass['socket']:.2f} s, decoding the iPad's {per_pass['decode']:.2f} s", flush=True)
+          f"{per_pass['socket']:.2f} s (receiving {per_pass['receive']:.2f} s), decoding the iPad's "
+          f"{per_pass['decode']:.2f} s, in sendall {per_pass['sending']:.2f} s", flush=True)
     print("iPad share per chunk: " + " ".join(f"{share:.0%}" for share in shares), flush=True)
+    if assist.stats["latency_blocks"]:
+        print(f"exchange latency per block, both ways (transfer and copies): "
+              f"{assist.stats['latency'] / assist.stats['latency_blocks'] * 1000:.1f} ms", flush=True)
     if args.split_only:
         assist.detach()
         return
