@@ -336,14 +336,27 @@ exo-ipad-spike app.
 
 The M5's GPU matrix units put it within ~10-25% of the M4 Max. The link is the limit: an iPad
 joins a Mac as a USB network device at 10 Gb/s (858 MB/s measured, 0.29 ms round trip), not over
-Thunderbolt networking. Each layer of each pass exchanges the chunk's K/V (~37 MB at 832x464), so
-at 832x464 with half the tokens on the iPad a chunk's DiT would take roughly 120 x (87 ms compute +
-~22 ms transfer) = ~13 s instead of ~21 s, more if transfers overlap compute. At 576x320 the
-gain shrinks to ~1.2-1.5x and at 416x240 the transfers cancel it. Building it needs the Wan /
-LingBot block in MLX-Swift, a K/V exchange per layer, and the refined cache sent to the iPad
-between turns. The whole-block times also suggest MLX runs this block ~1.4x faster than PyTorch
-MPS on the Mac at 832x464 (mostly the non-GEMM glue); the benchmark concatenates the cache, which
-the real DiT writes in place, so that gap needs checking on the real model.
+Thunderbolt networking. Each layer of each pass exchanges the chunk's K/V (~37 MB at 832x464).
+
+The synthetic blocks above concatenate the cache every block; the real DiT writes it in place.
+`scripts/lingbot_block_capture.py` saves the real block 0's inputs, weights and output during a
+full-cache chunk, and `scripts/lingbot_block_mlx.py` runs the same block in MLX (same dtype rules:
+FP32 residual and norm statistics, BF16 matmuls, FP32 RoPE rotations). At 832x464 the MLX block
+matches PyTorch to 8.4e-4 relative L2 (largest difference 0.047 on values up to 33, under half a
+BF16 step there) and takes:
+
+| real block 0, 832x464, full cache | per block | DiT per chunk |
+|---|---|---|
+| PyTorch MPS (the demo today) | 144.1 ms | 17.3 s |
+| MLX eager | 136.7 ms (1.05x) | 16.4 s |
+| MLX `mx.compile` | 127.4 ms (1.13x) | 15.3 s |
+
+So moving the Mac to MLX would buy ~13%, not the ~1.4x the synthetic blocks suggested. With half
+the tokens on an iPad about as fast as the Mac, a full-size chunk's DiT would take roughly
+120 x (72 ms compute + ~22 ms transfer) = ~11 s instead of ~17 s, more if transfers overlap
+compute. At 576x320 the gain shrinks to ~1.2-1.5x and at 416x240 the transfers cancel it. Building
+it needs the block in MLX-Swift (`lingbot_block_mlx.py` is the reference), a K/V exchange per layer,
+and the refined cache sent to the iPad between turns.
 
 ## What was changed for FastFrames-S (see `git diff`)
 
