@@ -117,6 +117,12 @@ class LazyImageCondition:
     when chunk ``l // 4`` needs it, while keeping the cache alive, performs the same computation:
     same results, without the multi-minute wait and peak memory of a long horizon.
     ``chunk(c)`` must be called with ``c = 0, 1, 2, ...`` (each at most once beyond the cache).
+
+    After the first image the encoder only sees black frames, and its causal state converges: at
+    832 x 464 the latents are bit-identical from latent 30 on. Once a new latent and the whole
+    feature cache are both bit-identical to the previous step's, the encoder is at a fixed point
+    (same state, same zero input), so every later latent equals the last one and is reused without
+    encoding: exactly the same values, ~1 s of VAE work per latent saved (~4 s per chunk on MPS).
     """
 
     def __init__(self, vae, image, latents, device):
@@ -128,10 +134,22 @@ class LazyImageCondition:
         self.first = F.interpolate(pixels[None], size=(HEIGHT, WIDTH), mode="bicubic").transpose(0, 1)[None]
         self.vae, self.latents, self.device = vae, latents, torch.device(device)
         self.encoded = []  # latent frames [16, 1, 58, 104] in order
+        self.steady = False  # the encoder reached its fixed point: later latents repeat the last one
+        self._previous_cache = None  # feature cache after the previous latent, kept once outputs repeat
         vae.model.clear_cache()
+
+    @staticmethod
+    def _same_cache(a, b):
+        return len(a) == len(b) and all(
+            torch.equal(x, y) if isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor) else
+            (not isinstance(x, torch.Tensor) and not isinstance(y, torch.Tensor) and x == y)
+            for x, y in zip(a, b))
 
     def _encode_next(self):
         model, index = self.vae.model, len(self.encoded)
+        if self.steady:
+            self.encoded.append(self.encoded[-1])
+            return
         frames = self.first if index == 0 else torch.zeros(1, 3, 4, HEIGHT, WIDTH)
         with torch.amp.autocast("cuda", dtype=self.vae.dtype, enabled=self.device.type == "cuda"):
             model._enc_conv_idx = [0]
@@ -143,7 +161,17 @@ class LazyImageCondition:
                 mu = (mu - scale[0].view(1, model.z_dim, 1, 1, 1)) * scale[1].view(1, model.z_dim, 1, 1, 1)
             else:
                 mu = (mu - scale[0]) * scale[1]
-        self.encoded.append(mu.float().squeeze(0))
+        latent = mu.float().squeeze(0)
+        cache = model._enc_feat_map
+        if index >= 2 and torch.equal(latent, self.encoded[-1]):
+            # Outputs repeat: check whether the whole causal state repeats too (fixed point)
+            if self._previous_cache is not None and self._same_cache(cache, self._previous_cache):
+                self.steady, self._previous_cache = True, None
+            else:
+                self._previous_cache = [x.clone() if isinstance(x, torch.Tensor) else x for x in cache]
+        else:
+            self._previous_cache = None
+        self.encoded.append(latent)
 
     def chunk(self, c):
         """``[20, 4, 58, 104]`` condition of latent frames ``[4c, 4c + 4)``."""
