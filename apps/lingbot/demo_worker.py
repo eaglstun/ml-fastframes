@@ -27,6 +27,7 @@ def _worker(rank, config, commands, replies, rendezvous):
     import torch
     import torch.distributed as dist
 
+    from apps.lingbot import conditioning
     from apps.lingbot.conditioning import KeyboardCamera, LiveCamera
     from apps.lingbot.pipeline import FastFramesLingBot, configure_backends
     from fastframes.device import default_device, synchronize
@@ -43,6 +44,7 @@ def _worker(rank, config, commands, replies, rendezvous):
         if cuda:
             torch.cuda.set_device(rank)
         configure_backends()
+        conditioning.set_size(*config.get("size", (conditioning.WIDTH, conditioning.HEIGHT)))
         if world > 1:
             from datetime import timedelta
 
@@ -122,7 +124,8 @@ def _worker(rank, config, commands, replies, rendezvous):
                         Image.fromarray(frame).save(buffer, format="JPEG", quality=90)
                         encoded.append(buffer.getvalue())
                     result = {"frames": encoded, "chunk_index": pipe.chunk - 1, "model_ms": model_ms,
-                              "terminal": pipe.chunk >= pipe.num_chunks, "width": 832, "height": 464}
+                              "terminal": pipe.chunk >= pipe.num_chunks, "width": conditioning.WIDTH,
+                              "height": conditioning.HEIGHT}
             elif op == "stop":
                 # No generation is in flight: the parent serializes all requests.
                 # Keep weights, compiled graphs and the last conditioning for restart.

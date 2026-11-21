@@ -39,6 +39,18 @@ LOGGER = logging.getLogger("lingbot.demo")
 STATIC = Path(__file__).with_name("static")
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP")  # decoders allowed for uploaded images
+DEFAULT_SIZE = (832, 464)  # LingBot's trained frame size (width, height)
+
+
+def parse_size(text):
+    """``--size`` ``"576x320"`` -> ``(576, 320)``; the worker's ``conditioning.set_size`` checks the rest."""
+    try:
+        width, height = (int(v) for v in text.lower().split("x"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"use WIDTHxHEIGHT, e.g. 576x320, not {text!r}") from None
+    if width % 16 or height % 16:
+        raise argparse.ArgumentTypeError("width and height must be multiples of 16")
+    return width, height
 
 
 def examples_from(root):
@@ -60,7 +72,7 @@ def examples_from(root):
     return examples
 
 
-def prepare_image(raw):
+def prepare_image(raw, size=DEFAULT_SIZE):
     if not raw or len(raw) > MAX_IMAGE_BYTES:
         raise ValueError("Choose an image smaller than 8 MiB")
     try:
@@ -68,7 +80,7 @@ def prepare_image(raw):
             if image.width * image.height > 16_000_000:
                 raise ValueError("Choose an image smaller than 16 megapixels")
             image = ImageOps.exif_transpose(image).convert("RGB")
-            image = ImageOps.fit(image, (832, 464), method=Image.Resampling.BICUBIC)
+            image = ImageOps.fit(image, tuple(size), method=Image.Resampling.BICUBIC)
             output = io.BytesIO()
             image.save(output, format="PNG")
             return output.getvalue()
@@ -76,7 +88,7 @@ def prepare_image(raw):
         raise ValueError("Could not read this image; use JPEG, PNG or WebP") from exc
 
 
-def start_arguments(payload, examples):
+def start_arguments(payload, examples, size=DEFAULT_SIZE):
     prompt = payload.get("prompt", "")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 1600:
         raise ValueError("Enter a prompt of 1–1600 characters")
@@ -101,7 +113,7 @@ def start_arguments(payload, examples):
         if not isinstance(example, str) or example not in examples:
             raise ValueError("Choose an example or upload a start image")
         raw = examples[example]["path"].read_bytes()
-    return {"prompt": prompt.strip(), "seed": seed, "image": prepare_image(raw)}
+    return {"prompt": prompt.strip(), "seed": seed, "image": prepare_image(raw, size)}
 
 
 @dataclass
@@ -172,7 +184,7 @@ class DemoApplication:
         room = self.waiting_room
         if kind == "start":
             # Validate before reserving the GPU; private inputs aren't broadcast.
-            args = start_arguments(payload, self.examples)
+            args = start_arguments(payload, self.examples, self.pool.config.get("size", DEFAULT_SIZE))
             await room.start(websocket, connection_id, args)
         elif kind == "join_queue":
             await room.join(connection_id)
@@ -365,7 +377,7 @@ def profile(args):
     if not examples:
         raise ValueError("VRAM profiling needs an upstream examples/<scene>/image.jpg and prompt.txt")
     example = next(iter(examples.values()))
-    image = prepare_image(example["path"].read_bytes())
+    image = prepare_image(example["path"].read_bytes(), args.size)
     start = {"image": image, "prompt": example["prompt"], "seed": 0}
     pool = WorkerPool(vars(args))
     try:
@@ -403,7 +415,12 @@ def main():
     parser.add_argument("--idle-timeout", type=float, default=120,
                         help="idle seconds before giving a waiting visitor a turn")
     parser.add_argument("--profile-vram", metavar="JSON", help="profile startup, generation and restarts, then exit")
+    parser.add_argument("--size", type=parse_size, default=DEFAULT_SIZE, metavar="WxH",
+                        help="frame size (default 832x464, the trained size). Smaller is much faster and out "
+                             "of distribution: 576x320 is ~4x faster per chunk and softer; 416x240 melts")
     args = parser.parse_args()
+    if args.size != DEFAULT_SIZE and args.gpus != 1:
+        parser.error("--size other than 832x464 was only tried on one device")
     if not args.lingbot_root or not Path(args.lingbot_root, "wan", "modules", "model_fast.py").is_file():
         parser.error("set LINGBOT_WORLD_ROOT or --lingbot-root to the pinned upstream clone "
                      "(see docs/lingbot.md)")

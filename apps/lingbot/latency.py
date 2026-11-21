@@ -34,8 +34,9 @@ import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 from PIL import Image  # noqa: E402
 
+from apps.lingbot import conditioning  # noqa: E402
 from apps.lingbot.conditioning import Trajectory  # noqa: E402
-from apps.lingbot.generate import add_model_arguments, init_distributed, load_pipeline  # noqa: E402
+from apps.lingbot.generate import add_model_arguments, apply_size, init_distributed, load_pipeline  # noqa: E402
 from apps.lingbot.upstream import import_upstream  # noqa: E402
 from fastframes.device import default_device, device_name, limit_mps_memory, synchronize  # noqa: E402
 
@@ -71,6 +72,7 @@ def main():
     torch.set_num_threads(4)
 
     world, rank = init_distributed()
+    apply_size(args, world)
     # fail with out-of-memory instead of swapping the machine into a stall; the first chunk's VAE
     # encode needs more than the 0.6 default (31 GB on a 64 GB M4 Max)
     limit_mps_memory(default=0.75)
@@ -101,7 +103,8 @@ def main():
         if passes == 3:
             raise RuntimeError("compilation did not settle within three warm-up passes")
 
-    host = torch.empty((16, 464, 832, 3), dtype=torch.uint8, pin_memory=cuda) if rank == 0 else None
+    host = (torch.empty((16, conditioning.HEIGHT, conditioning.WIDTH, 3), dtype=torch.uint8, pin_memory=cuda)
+            if rank == 0 else None)
     samples, timed, clip = [], 0.0, 0
     before = compiler_counters()
 
@@ -139,6 +142,7 @@ def main():
         values = [s["ms"] for s in samples]
         record = dict(
             model=args.model, variant="fastframes", gpus=world, example=example.name, frames=args.frames,
+            size=f"{conditioning.WIDTH}x{conditioning.HEIGHT}",
             model_ms=statistics.median(values), mean_ms=statistics.mean(values), min_ms=min(values),
             max_ms=max(values), samples=len(values), timed_seconds=timed, warmup_passes=passes,
             cpu_ready_ms=statistics.median(s["cpu_ready_ms"] for s in samples),

@@ -32,6 +32,9 @@ def main():
             r = json.loads(path.read_text())
         except ValueError:
             continue
+        if isinstance(r, dict) and r.get("size", "832x464") != "832x464":
+            print(f"skipping {path}: measured at {r['size']}, not the paper's 832x464")
+            continue
         if isinstance(r, dict) and {"model", "variant", "gpus", "model_ms"} <= r.keys():
             records.setdefault((r["model"], r["variant"], r["gpus"]), []).append((str(path), r["model_ms"]))
     rows = []

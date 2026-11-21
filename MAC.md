@@ -136,6 +136,29 @@ chunks) and then hold at ~24 s, in line with `latency.py`'s 25.9 s per full-cach
 83 GB (upstream conditioning) to 43 GB on a 2-chunk `generate.py` run; since the pipeline releases
 cached blocks after each chunk, `latency.py` holds a flat ~23 GB of driver memory.
 
+### Smaller frames for speed (`--size`)
+
+`generate.py`, `latency.py` and `demo.py` take `--size WxH` (multiples of 16, one device). Only
+832x464 is what LingBot and the FastFrames refiner/decoder were trained at, so smaller sizes trade
+fidelity for speed. Example 00, seed 0, same camera path, M4 Max:
+
+| size    | tokens/frame | full-cache chunk (`generate`-style, condition inline) | demo turn (5 s think time) | look                                                                                |
+| ------- | ------------ | ----------------------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------- |
+| 832x464 | 1508         | 30.9 s                                                | ~20-25 s                   | the model as trained                                                                |
+| 576x320 | 720          | 7.2 s                                                 | **4.6-5.9 s** (turns 1-8)  | softer detail, coherent; a different take on the scene; follows the camera less far |
+| 416x240 | 390          | 3.6 s                                                 | not measured               | melts within ~8 chunks (the horse smears) and stops following the camera            |
+
+At 576x320 attention shrinks faster than the token count (both the chunk and the cache get
+smaller), so a chunk is 4.3x faster for 2.1x fewer tokens. A 125-frame `generate.py` video takes
+60 s, and the demo peaks at ~13 GB of MPS memory against ~18 GB at full size. A different size
+draws different noise, so it's a different world from the same image and prompt, not a
+downscaled one. `latency.py` records the size and `summarize.py` skips records not taken at
+832x464.
+
+```bash
+.venv/bin/python apps/lingbot/demo.py --gpus 1 --lingbot-root upstream/lingbot-world-v2 --size 576x320
+```
+
 What changed for LingBot:
 
 | Problem on Mac                                                                                                                                                                                                  | Fix                                                                                                                                                                             |

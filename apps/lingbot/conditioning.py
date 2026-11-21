@@ -29,13 +29,54 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-__all__ = ["HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH", "CHUNK", "DEFAULT_INTRINSICS",
+__all__ = ["HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH", "CHUNK", "DEFAULT_INTRINSICS", "DEFAULT_SIZE",
+           "parse_size", "set_size",
            "text_context", "image_condition", "LazyImageCondition", "latent_count", "Trajectory", "LiveCamera",
            "KeyboardCamera", "ACTIONS"]
 
 HEIGHT, WIDTH = 464, 832
 LATENT_HEIGHT, LATENT_WIDTH = 58, 104
 CHUNK = 4  # latent frames per generation step
+DEFAULT_SIZE = (WIDTH, HEIGHT)  # the size LingBot and the FastFrames networks were trained at
+
+
+def parse_size(text):
+    """``"832x464"`` (width x height) -> ``(832, 464)``."""
+    try:
+        width, height = (int(v) for v in text.lower().split("x"))
+    except ValueError:
+        raise ValueError(f"size must look like 576x320 (width x height), got {text!r}") from None
+    return width, height
+
+
+def set_size(width, height):
+    """Generate ``width x height`` frames instead of the trained ``832 x 464``; call before building a pipeline.
+
+    Only 832 x 464 is what LingBot and the FastFrames networks were trained at. Smaller sizes run
+    much faster (on an M4 Max, a full-cache chunk takes ~7 s at 576 x 320 and ~3.6 s at 416 x 240,
+    against ~31 s) and are increasingly out of distribution: softer frames, and at 416 x 240 the
+    scene melts and stops following the camera within a few chunks. Both sides must be multiples
+    of 16 (8x VAE downsampling, then 2x2 DiT patches).
+
+    The size constants are module globals copied by ``from .conditioning import ...`` into the
+    other LingBot modules, so this updates them (and the token counts derived from them) in every
+    loaded ``apps.lingbot`` module; modules imported later read the new values here.
+    """
+    import sys
+
+    width, height = int(width), int(height)
+    if width % 16 or height % 16 or not (128 <= width <= 1280 and 128 <= height <= 1280):
+        raise ValueError(f"LingBot sizes are multiples of 16 between 128 and 1280, got {width} x {height}")
+    grid_h, grid_w = height // 16, width // 16
+    values = {"HEIGHT": height, "WIDTH": width, "LATENT_HEIGHT": height // 8, "LATENT_WIDTH": width // 8,
+              "GRID_H": grid_h, "GRID_W": grid_w, "FRAME_TOKENS": grid_h * grid_w,
+              "TOKENS": CHUNK * grid_h * grid_w}
+    globals().update({k: values[k] for k in ("HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH")})
+    for name, module in list(sys.modules.items()):
+        if module is not None and name.startswith("apps.lingbot.") and name != __name__:
+            for key, value in values.items():
+                if key in vars(module):
+                    setattr(module, key, value)
 # fx, fy, cx, cy for 480 x 832 frames (the intrinsics of upstream example 00).
 DEFAULT_INTRINSICS = (502.9116, 503.10812, 415.77786, 239.77779)
 
