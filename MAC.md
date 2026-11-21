@@ -319,7 +319,7 @@ is an A/B measured back to back or interleaved, not an absolute benchmark.
 What's left in a full-cache LingBot chunk is mostly attention (~60%) and GEMMs, which run at
 12.4-14.2 TFLOPS (MPS's own matmul), close to what this GPU does.
 
-## Splitting a chunk with an iPad (measured, not built)
+## Splitting a chunk with an iPad
 
 Could an iPad Pro share the DiT's work over a cable? Splitting *layers* between devices (exo's
 remote stage) can't help: the passes are sequential, so one device always waits. Splitting a
@@ -334,7 +334,8 @@ exo-ipad-spike app.
 | 576x320 | 39.5 ms | 39.2 ms | 50.2 ms |
 | 416x240 | 17.7 ms | 17.7 ms | 22.9 ms |
 
-The M5's GPU matrix units put it within ~10-25% of the M4 Max. The link is the limit: an iPad
+In a short burst the M5's GPU matrix units put it within ~10-25% of the M4 Max; under sustained
+load it settles at about half the Mac (below). The link adds its own cost: an iPad
 joins a Mac as a USB network device at 10 Gb/s (858 MB/s measured, 0.29 ms round trip), not over
 Thunderbolt networking. Each layer of each pass exchanges the chunk's K/V (~37 MB at 832x464).
 
@@ -350,13 +351,15 @@ BF16 step there) and takes:
 | PyTorch MPS (the demo today) | 144.1 ms | 17.3 s |
 | MLX eager | 136.7 ms (1.05x) | 16.4 s |
 | MLX `mx.compile` | 127.4 ms (1.13x) | 15.3 s |
-| iPad Pro 11" M5, MLX-Swift compiled (`DiTBlockCheck.swift`) | 156.8 ms (0.92x) | 18.8 s |
+| iPad Pro 11" M5, MLX-Swift compiled (`DiTBlockCheck.swift`), burst | 156.8 ms (0.92x) | 18.8 s |
+| the same iPad after ~50 s of GPU load | ~270 ms (~0.53x) | ~32 s |
 
 The iPad's block matches PyTorch to 1.2e-3 relative L2 (max 0.089 on values up to 33, under one
 BF16 step there); eager it takes 209.7 ms, so compiling matters more there than on the Mac.
 
-So moving the Mac to MLX would buy ~13%, not the ~1.4x the synthetic blocks suggested. With the
-iPad at 0.92x the Mac, it should take ~48% of the tokens; a full-size chunk's DiT would then take
+So moving the Mac to MLX would buy ~13%, not the ~1.4x the synthetic blocks suggested. The
+projection that follows used the burst figure, which the iPad doesn't sustain: at 0.92x the Mac it
+would take ~48% of the tokens; a full-size chunk's DiT would then take
 roughly 120 x (75 ms compute + ~22 ms transfer) = ~11.6 s instead of ~17.3 s (1.5x), up to ~1.9x
 if transfers overlap compute. At 576x320 the gain shrinks to ~1.2-1.5x and at 416x240 the transfers cancel it. Building
 it needs the block in MLX-Swift (`lingbot_block_mlx.py` is the reference), a K/V exchange per layer,
@@ -385,11 +388,22 @@ The split frames show the same scene and stay clean; their details drift from th
 autoregressive model's do from any small difference (PSNR 43 dB at chunk 0, ~20 dB by chunk 9). In
 the browser demo full-size turns took 10.7 / 12.0 s of model time against 11.6-12.2 / 15.6 s
 alone; at 576x320 and 416x240 the exchange costs more than the iPad saves (4.6 vs 4.4 s, 3.4 vs
-2.6 s), so the demo shares only 832x464 unless `--ipad-all-sizes`. The iPad stayed thermally
-nominal; what's left is the exchange itself: both sides wait 1-1.4 s per pass for the other's K/V
-(12 MB per block each way over the 858 MB/s link, plus copies). Hiding it means attending over the
-cached rows while the other side's are in flight and merging with a log-sum-exp, which neither the
-Metal flash kernel here nor MLX's attention returns yet.
+2.6 s), so the demo shares only 832x464 unless `--ipad-all-sizes`.
+
+**Why 1.26x and not ~1.5x: the iPad's GPU throttles under sustained load.** It holds benchmark
+speed for ~20-27 s of continuous GPU work, then drops to ~0.5-0.6x and stays there; ~30 s idle
+buys back ~10 s of full speed (hence the faster first turns in the demo, which idles between
+turns). exo-ipad-spike's `mac/split_fake_mac.py` drives the iPad's side with random weights and no
+Mac model: with no traffic at all (`--solo`) a 2960-token pass over 27144 cache rows goes from 2.5 s
+to 4.0-4.4 s after the eighth pass, at 6032 or 27144 rows and at 5.4 or 9.3 GB footprint alike;
+the exchange adds ~20% on top only once throttled (4.9 s; a real session 5.0-5.3 s). The iPad's
+`thermalState` stays nominal, thermal pressure 0, a fixed CPU loop steady and the battery full
+throughout, so iOS doesn't report it; nothing in software moved it (zero-copy sockets, idling the
+GPU between passes). The adaptive split absorbs it by moving tokens back to the Mac (the 38-55%
+shares above). What's left: cooling the iPad, cheaper attention on it, and hiding the K/V
+exchange (each side waits for the other's 12 MB per block) by attending over cached rows while the
+other side's are in flight and merging with a log-sum-exp, which neither the Metal flash kernel here
+nor MLX's attention returns yet.
 
 ## What was changed for FastFrames-S (see `git diff`)
 
