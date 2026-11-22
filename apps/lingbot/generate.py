@@ -24,7 +24,8 @@ import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from apps.lingbot.conditioning import CHUNK, DEFAULT_SIZE, KeyboardCamera, LiveCamera, Trajectory, parse_size, set_size  # noqa: E402
+from apps.lingbot.conditioning import (CHUNK, DEFAULT_SIZE, KeyboardCamera, LiveCamera, Trajectory,  # noqa: E402
+                                       encode_structure, parse_size, set_size)
 from apps.lingbot.pipeline import MODELS, FastFramesLingBot, configure_backends  # noqa: E402
 from apps.lingbot.upstream import import_upstream  # noqa: E402
 from fastframes.device import default_device, synchronize  # noqa: E402
@@ -124,6 +125,11 @@ def main():
     source.add_argument("--example", type=Path, help="an upstream example directory")
     parser.add_argument("--prompt", help="override the prompt")
     parser.add_argument("--image", type=Path, help="override the first image")
+    parser.add_argument("--structure", type=Path,
+                        help="directory of frames at 16 fps (e.g. blender_stage.py --structure) that steer every "
+                        "frame, SDEdit style; frame 0 is the first image's view")
+    parser.add_argument("--structure-step", type=int, default=2,
+                        help="denoising step the structure starts at, 1-3: higher follows it more closely, rougher")
     parser.add_argument("--frames", type=int, help="RGB frames to generate (rounded down to whole chunks)")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--output", type=Path, required=True)
@@ -135,8 +141,16 @@ def main():
     image, prompt, rays, chunks, seed = read_condition(args)
     pipe = load_pipeline(args, world, rank)
     start = time.perf_counter()
+    structure = None
+    if args.structure is not None:
+        paths = sorted(p for p in args.structure.iterdir() if p.suffix.lower() in (".png", ".jpg", ".jpeg"))
+        # before start(): both use the VAE encoder's feature cache
+        structure = encode_structure(pipe.upstream.vae, [Image.open(p) for p in paths], CHUNK * chunks,
+                                     pipe.device)
     pipe.start(image, prompt, seed=seed, latents=CHUNK * chunks)
-    frames = [pipe.step(rays(chunk)) for chunk in range(chunks)]
+    frames = [pipe.step(rays(chunk), structure=None if structure is None else
+                        structure[:, CHUNK * chunk:CHUNK * (chunk + 1)], structure_step=args.structure_step)
+              for chunk in range(chunks)]
     synchronize(pipe.device)
     if rank == 0:
         video = torch.cat(frames).cpu()

@@ -226,14 +226,40 @@ available memory). The video follows the Blender camera through the dolly and bo
 
 What to expect:
 
-- Only the first frame sees your blocking. LingBot follows the camera exactly but invents everything
-  the first frame doesn't show: a doorway built off-screen comes back as a different doorway.
+- Without `--structure` (below), only the first frame sees your blocking. LingBot follows the camera
+  exactly but invents everything the first frame doesn't show: a doorway built off-screen comes back
+  as a different doorway.
 - The ControlNet reads shape, not intent: 1.4 m boxes standing in for cars became concrete planters.
   Rough-model the things that need to read correctly, or name them in the prompt.
 - Plain image-to-image from `staging.png` doesn't work. FLUX keeps the grey palette and paints fog
   (strength 0.65), or loses the layout (0.8). Use the depth map.
 - Scale doesn't matter. LingBot normalizes the path's translations, so only the shape of the move
   counts. `--start`/`--end` pick the frame range; the path is cut to `4k + 1` frames (at least 13).
+
+#### Steering every frame (`--structure`)
+
+`blender_stage.py --structure` also renders every path frame to `structure/`, and
+`generate.py --structure outputs/stage/structure` steers each chunk with them, SDEdit style. The
+grey-box video is VAE-encoded one latent at a time, and each chunk starts from its latents noised
+to denoising step `--structure-step` (default 2) instead of from pure noise. The steps before that
+are skipped.
+
+The structure latents are recoloured to the first image first: their per-channel mean and std
+are matched to its latent. Without that, a flat grey render survives the noise as its colour and
+brightness, and every frame comes out as grey fog, even at step 1 (6% structure).
+
+Same street and seed, from the same keyframe (frame-identical to the scratch test):
+
+| Start                      | Steps | Video (77 frames)   | Result                                                                                |
+| -------------------------- | ----- | ------------------- | ------------------------------------------------------------------------------------- |
+| pure noise (no structure)  | 4     | 98-105 s            | the grey box only shapes frame 0                                                      |
+| `--structure-step 1` (6%)  | 3     | 81 s                | as clean as no structure; follows the blocking loosely                                |
+| `--structure-step 2` (17%) | 2     | 66 s (+18 s encode) | per-frame blocking: car-sized boxes become cars where they stand; murkier, brown cast |
+| step 2 without recolouring | 2     | 58 s                | grey fog                                                                              |
+
+Step 3 (38%, one step) was only tried without recolouring. A more detailed grey box should help
+step 2 most, since less is left to invent. Without `--structure`, `step()` is unchanged: the video
+is frame-identical to before.
 
 ## Latency benchmarks
 
