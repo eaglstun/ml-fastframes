@@ -26,12 +26,13 @@ import math
 import warnings
 
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn.functional as F
 
 __all__ = ["HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH", "CHUNK", "DEFAULT_INTRINSICS", "DEFAULT_SIZE",
            "parse_size", "set_size",
-           "text_context", "image_condition", "LazyImageCondition", "encode_structure", "recolor", "latent_count", "Trajectory", "LiveCamera",
+           "text_context", "image_condition", "LazyImageCondition", "encode_structure", "sky_color", "recolor", "latent_count", "Trajectory", "LiveCamera",
            "KeyboardCamera", "ACTIONS"]
 
 HEIGHT, WIDTH = 464, 832
@@ -135,21 +136,49 @@ def _encode_latent(vae, frames, device):
     return mu.float().squeeze(0)
 
 
-def encode_structure(vae, images, latents, device):
+def sky_color(first_image, structure_frame):
+    """Mean RGB (0-1) of ``first_image`` where the first structure frame is transparent (its sky),
+    or ``None`` if the frame has no alpha or no transparent pixels."""
+    if "A" not in structure_frame.getbands():
+        return None
+    alpha = np.asarray(structure_frame.getchannel("A"), dtype=np.float32) / 255
+    sky = alpha < 0.5
+    if not sky.any():
+        return None
+    rgb = np.asarray(first_image.convert("RGB").resize(structure_frame.size, Image.BICUBIC), dtype=np.float32) / 255
+    return tuple(float(c) for c in rgb[sky].mean(axis=0))
+
+
+def _structure_pixels(image, sky):
+    """``[3, H, W]`` in [-1, 1]; a transparent background is filled with ``sky`` (straight alpha)."""
+    from torchvision.transforms import functional as TF
+
+    if sky is not None and "A" in image.getbands():
+        rgba = TF.to_tensor(image.convert("RGBA"))
+        fill = torch.tensor(sky, dtype=rgba.dtype).view(3, 1, 1)
+        rgb = rgba[:3] * rgba[3:] + fill * (1 - rgba[3:])
+    else:
+        rgb = TF.to_tensor(image.convert("RGB"))
+    return F.interpolate(rgb.sub_(0.5).div_(0.5)[None], size=(HEIGHT, WIDTH), mode="bicubic")[0]
+
+
+def encode_structure(vae, images, latents, device, first_image=None):
     """Structure video (PIL frames at 16 fps, e.g. a grey-box render of the camera path) ->
     ``[16, latents, 58, 104]`` latents for ``FastFramesLingBot.step(structure=...)``.
 
     Encoded one latent at a time with the causal feature cache, like ``LazyImageCondition``
     (encoding a long video in one call corrupts the last latent on MPS). Needs the first
     ``4 * (latents - 1) + 1`` frames. Run it before ``start()``, which resets the encoder cache.
-    """
-    from torchvision.transforms import functional as TF
 
+    Frames with a transparent sky (``blender_stage.py --structure``) get the sky colour of
+    ``first_image`` (``sky_color``): a fixed backdrop colour pulls ``recolor``'s whole-frame
+    statistics toward it, e.g. a light grey-box sky turned a black night sky hazy and bright.
+    """
     count = 4 * (latents - 1) + 1
     if len(images) < count:
         raise ValueError(f"{latents} latent frames need {count} structure frames, got {len(images)}")
-    pixels = [F.interpolate(TF.to_tensor(image.convert("RGB")).sub_(0.5).div_(0.5)[None], size=(HEIGHT, WIDTH),
-                            mode="bicubic")[0] for image in images[:count]]
+    sky = sky_color(first_image, images[0]) if first_image is not None else None
+    pixels = [_structure_pixels(image, sky) for image in images[:count]]
     video = torch.stack(pixels, dim=1)[None]  # [1, 3, frames, H, W]
     vae.model.clear_cache()
     encoded = [_encode_latent(vae, video[:, :, :1], device)]

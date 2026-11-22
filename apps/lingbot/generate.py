@@ -146,7 +146,7 @@ def main():
         paths = sorted(p for p in args.structure.iterdir() if p.suffix.lower() in (".png", ".jpg", ".jpeg"))
         # before start(): both use the VAE encoder's feature cache
         structure = encode_structure(pipe.upstream.vae, [Image.open(p) for p in paths], CHUNK * chunks,
-                                     pipe.device)
+                                     pipe.device, first_image=image)
     pipe.start(image, prompt, seed=seed, latents=CHUNK * chunks)
     frames = [pipe.step(rays(chunk), structure=None if structure is None else
                         structure[:, CHUNK * chunk:CHUNK * (chunk + 1)], structure_step=args.structure_step)
