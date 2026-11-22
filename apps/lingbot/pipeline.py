@@ -34,7 +34,7 @@ from fastframes.models.kv_refinement import KVRefinementNetwork
 from fastframes.models.pixel_decoder import PixelDecoder
 from fastframes.pipeline import to_uint8
 
-from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH, LazyImageCondition, text_context
+from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH, LazyImageCondition, recolor, text_context
 from .decoder import CapturedDecoder, SpatialDecoder
 from .dit import CACHE_FRAMES, FRAME_TOKENS, LingBotDiT, rope_frequencies, rope_table
 from .refiner import KVRefiner
@@ -227,7 +227,8 @@ class FastFramesLingBot:
                 self.assist.evict(sink, shift, rolled)
 
     @torch.inference_mode()
-    def step(self, rays, *, defer_cache=False, preview=None, preview_passes=(0, 1)):
+    def step(self, rays, *, defer_cache=False, preview=None, preview_passes=(0, 1), structure=None,
+             structure_step=2):
         """Generate the next chunk for camera ``rays`` (``Trajectory.rays`` / ``LiveCamera.rays``).
 
         Returns ``[16, 464, 832, 3]`` uint8 frames on rank 0 (13 for the first chunk: the pixel
@@ -242,6 +243,11 @@ class FastFramesLingBot:
         passes in ``preview_passes`` (0-based, before the last): rough frames of this chunk
         available well before it's done. The decoder's history is restored afterwards, so the
         final frames are unchanged.
+
+        ``structure`` (``[16, 4, 58, 104]``, this chunk's slice of ``encode_structure``) steers
+        every frame, SDEdit style: recoloured to the first image (``recolor``), noised to
+        denoising step ``structure_step`` (1-3) and denoised from there, skipping the earlier
+        steps. Higher steps follow the structure more closely and look rougher; 2 is the balance.
         """
         if preview is not None and self.world != 1:
             raise ValueError("previews need a single device")
@@ -258,7 +264,17 @@ class FastFramesLingBot:
             x = self.noise[:, CHUNK * chunk:CHUNK * (chunk + 1)]
         else:
             x = torch.randn((16, CHUNK, LATENT_HEIGHT, LATENT_WIDTH), device=self.device, generator=self.generator)
-        for i, timestep in enumerate(self.timesteps):
+        first_step = 0
+        if structure is not None:
+            if not 1 <= structure_step < len(self.timesteps):
+                raise ValueError(f"structure_step must be in [1, {len(self.timesteps) - 1}]")
+            target = recolor(structure.to(self.device, torch.float32), self.condition.encoded[0])
+            if chunk == 0:  # latent 0 is the first image itself
+                target[:, 0] = self.condition.encoded[0][:, 0]
+            x = self.scheduler.add_noise(target, x, self.schedule[structure_step])
+            first_step = structure_step
+        for i in range(first_step, len(self.timesteps)):
+            timestep = self.timesteps[i]
             previewed = preview is not None and i in preview_passes and i + 1 < len(self.timesteps)
             result = self.dit(x, timestep, read_frames, capture=True if previewed else None)
             if previewed:

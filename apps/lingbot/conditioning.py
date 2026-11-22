@@ -31,7 +31,7 @@ import torch.nn.functional as F
 
 __all__ = ["HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH", "CHUNK", "DEFAULT_INTRINSICS", "DEFAULT_SIZE",
            "parse_size", "set_size",
-           "text_context", "image_condition", "LazyImageCondition", "latent_count", "Trajectory", "LiveCamera",
+           "text_context", "image_condition", "LazyImageCondition", "encode_structure", "recolor", "latent_count", "Trajectory", "LiveCamera",
            "KeyboardCamera", "ACTIONS"]
 
 HEIGHT, WIDTH = 464, 832
@@ -119,6 +119,58 @@ def image_condition(vae, image, latents, device):
     return torch.cat([mask, encoded])
 
 
+def _encode_latent(vae, frames, device):
+    """The next latent frame ``[16, 1, 58, 104]`` of the causal VAE encoder for ``frames``
+    ``[1, 3, n, H, W]`` (1 frame for the first latent, 4 after), continuing its feature cache."""
+    model, device = vae.model, torch.device(device)
+    with torch.amp.autocast("cuda", dtype=vae.dtype, enabled=device.type == "cuda"):
+        model._enc_conv_idx = [0]
+        out = model.encoder(frames.to(device), feat_cache=model._enc_feat_map, feat_idx=model._enc_conv_idx)
+        mu = model.conv1(out).chunk(2, dim=1)[0]
+        scale = vae.scale
+        if isinstance(scale[0], torch.Tensor):
+            mu = (mu - scale[0].view(1, model.z_dim, 1, 1, 1)) * scale[1].view(1, model.z_dim, 1, 1, 1)
+        else:
+            mu = (mu - scale[0]) * scale[1]
+    return mu.float().squeeze(0)
+
+
+def encode_structure(vae, images, latents, device):
+    """Structure video (PIL frames at 16 fps, e.g. a grey-box render of the camera path) ->
+    ``[16, latents, 58, 104]`` latents for ``FastFramesLingBot.step(structure=...)``.
+
+    Encoded one latent at a time with the causal feature cache, like ``LazyImageCondition``
+    (encoding a long video in one call corrupts the last latent on MPS). Needs the first
+    ``4 * (latents - 1) + 1`` frames. Run it before ``start()``, which resets the encoder cache.
+    """
+    from torchvision.transforms import functional as TF
+
+    count = 4 * (latents - 1) + 1
+    if len(images) < count:
+        raise ValueError(f"{latents} latent frames need {count} structure frames, got {len(images)}")
+    pixels = [F.interpolate(TF.to_tensor(image.convert("RGB")).sub_(0.5).div_(0.5)[None], size=(HEIGHT, WIDTH),
+                            mode="bicubic")[0] for image in images[:count]]
+    video = torch.stack(pixels, dim=1)[None]  # [1, 3, frames, H, W]
+    vae.model.clear_cache()
+    encoded = [_encode_latent(vae, video[:, :, :1], device)]
+    for start in range(1, count, 4):
+        encoded.append(_encode_latent(vae, video[:, :, start:start + 4], device))
+    vae.model.clear_cache()
+    return torch.cat(encoded, dim=1)
+
+
+def recolor(latents, reference):
+    """Match every latent frame's per-channel mean and std to ``reference`` ``[16, 1, h, w]``.
+
+    A flat grey structure render survives the noise of the structure start as its colour and
+    brightness (frames come out as grey fog); matched to the first image's statistics, it
+    keeps its shapes and takes the first image's palette.
+    """
+    mean, std = latents.mean(dim=(2, 3), keepdim=True), latents.std(dim=(2, 3), keepdim=True)
+    ref_mean, ref_std = reference.mean(dim=(2, 3), keepdim=True), reference.std(dim=(2, 3), keepdim=True)
+    return (latents - mean) / (std + 1e-6) * ref_std + ref_mean
+
+
 class LazyImageCondition:
     """``image_condition`` encoded chunk by chunk, on first use.
 
@@ -162,17 +214,7 @@ class LazyImageCondition:
             self.encoded.append(self.encoded[-1])
             return
         frames = self.first if index == 0 else torch.zeros(1, 3, 4, HEIGHT, WIDTH)
-        with torch.amp.autocast("cuda", dtype=self.vae.dtype, enabled=self.device.type == "cuda"):
-            model._enc_conv_idx = [0]
-            out = model.encoder(frames.to(self.device), feat_cache=model._enc_feat_map,
-                                feat_idx=model._enc_conv_idx)
-            mu = model.conv1(out).chunk(2, dim=1)[0]
-            scale = self.vae.scale
-            if isinstance(scale[0], torch.Tensor):
-                mu = (mu - scale[0].view(1, model.z_dim, 1, 1, 1)) * scale[1].view(1, model.z_dim, 1, 1, 1)
-            else:
-                mu = (mu - scale[0]) * scale[1]
-        latent = mu.float().squeeze(0)
+        latent = _encode_latent(self.vae, frames, self.device)
         cache = model._enc_feat_map
         if index >= 2 and torch.equal(latent, self.encoded[-1]):
             # Outputs repeat: check whether the whole causal state repeats too (fixed point)

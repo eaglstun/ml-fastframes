@@ -17,9 +17,12 @@ Writes to ``--out``:
   forward) sampled at LingBot's 16 fps from the start frame, ``N = 4k + 1``;
 * ``intrinsics.npy`` -- ``[N, 4]`` fx, fy, cx, cy in pixels of a 480 x 832 frame;
 * ``condition.json`` -- for ``generate.py --condition`` (its image is ``staging.png``;
-  pass ``--image`` there to start from the restyled frame instead).
+  pass ``--image`` there to start from the restyled frame instead);
+* ``structure/`` (with ``--structure``) -- every path frame as rendered, for
+  ``generate.py --structure``, which steers each frame with them (SDEdit).
 
-Only the start frame's look reaches LingBot; the camera path is followed for every frame.
+Without ``--structure`` only the start frame's look reaches LingBot; the camera path is
+followed for every frame either way.
 LingBot normalizes the path's scale, so scene units don't matter, only the shape of the move.
 """
 import argparse
@@ -47,6 +50,8 @@ def parse_args():
     parser.add_argument("--prompt", default="", help="LingBot prompt written to condition.json")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-render", action="store_true", help="export the camera only")
+    parser.add_argument("--structure", action="store_true",
+                        help="also render every path frame to structure/ (for generate.py --structure)")
     return parser.parse_args(argv)
 
 
@@ -164,6 +169,14 @@ def main():
     settings.image_settings.file_format = "PNG"
     settings.image_settings.color_mode = "RGB"
     render(scene, args.out / "staging.png")
+    if args.structure:  # the path's frames at 16 fps, as seen by the scene's own renderer
+        fps = scene.render.fps / scene.render.fps_base
+        for index in range(len(poses)):
+            frame = start + index * fps / FPS
+            whole = math.floor(frame)
+            scene.frame_set(whole, subframe=frame - whole)
+            render(scene, args.out / "structure" / f"{index:04d}.png")
+        scene.frame_set(start)
 
     # Depth: raw Z into a float EXR (transparent film = sky), then inverse depth as a PNG.
     view_layer, image = bpy.context.view_layer, settings.image_settings
