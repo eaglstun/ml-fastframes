@@ -99,7 +99,7 @@ def read_condition(args):
             warnings.warn(f"{base} has no prompt.txt; generating with an empty prompt (pass --prompt)")
     else:
         base, spec = args.condition.parent, json.loads(args.condition.read_text())
-    image = Image.open(base / spec["image"]).convert("RGB")
+    image = Image.open(args.image or base / spec["image"]).convert("RGB")
     prompt = args.prompt if args.prompt is not None else spec["prompt"]
     seed = args.seed if args.seed is not None else int(spec.get("seed", 0))
     frames = args.frames or spec.get("frames")
@@ -123,6 +123,7 @@ def main():
     source.add_argument("--condition", type=Path, help="JSON condition file")
     source.add_argument("--example", type=Path, help="an upstream example directory")
     parser.add_argument("--prompt", help="override the prompt")
+    parser.add_argument("--image", type=Path, help="override the first image")
     parser.add_argument("--frames", type=int, help="RGB frames to generate (rounded down to whole chunks)")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--output", type=Path, required=True)

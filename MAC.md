@@ -196,6 +196,45 @@ What changed for LingBot:
 | `from_pretrained(device=None)` left the refiner/decoder on CPU                                                                                                                                                  | The device is resolved once at the top (`default_device()`)                                                                                                                     |
 | Demo memory stats call `torch.cuda`                                                                                                                                                                             | MPS reports `current_allocated_memory` / `driver_allocated_memory`                                                                                                              |
 
+### From a Blender grey box
+
+Block out a scene in Blender, animate its camera, and LingBot flies the same path through a photoreal
+version of it. `apps/lingbot/blender_stage.py` runs inside Blender and exports the camera path at 16 fps
+as OpenCV camera-to-world poses plus intrinsics (`poses.npy`, `intrinsics.npy`, `condition.json`). It
+also writes the start frame twice: `staging.png` (the render) and `depth.png` (inverse depth, near white,
+normalized over the visible pixels). A depth ControlNet turns `depth.png` into the real first frame, and
+`generate.py --image` starts from it:
+
+```bash
+/Applications/Blender.app/Contents/MacOS/Blender -b scene.blend --python apps/lingbot/blender_stage.py -- \
+    --out outputs/stage --prompt "A rainy city street at dusk, wet asphalt reflecting neon signs"
+# first frame: FLUX.1-dev + Union Pro 2.0 depth in Draw Things (any depth ControlNet works), 2x size
+sips -z 960 1664 outputs/stage/depth.png --out outputs/stage/depth_2x.png
+draw-things-cli generate --model flux_1_dev_q8p.ckpt --prompt "Photograph of a rainy city street ..." \
+    --image outputs/stage/depth_2x.png --strength 1.0 --config-file union_depth.json \
+    --width 1664 --height 960 --steps 20 --cfg 3.5 --output outputs/stage/keyframe.png
+.venv/bin/python apps/lingbot/generate.py --model lingbot-1.3b --lingbot-root upstream/lingbot-world-v2 \
+    --condition outputs/stage/condition.json --image outputs/stage/keyframe.png --output outputs/stage.mp4
+```
+
+`union_depth.json` holds one `controls` entry: `controlnet_union_pro_flux_1_dev_2.0_q5p.ckpt`, weight
+0.8, `inputOverride` `depth`, guidance 0-0.7.
+
+Measured on a 5 s street dolly (boxes for buildings and cars, a camera that yaws right, then left):
+the export takes 4 s, the 1664x960 keyframe 228 s, and the 77-frame video 105 s (13.5 GB minimum
+available memory). The video follows the Blender camera through the dolly and both turns.
+
+What to expect:
+
+- Only the first frame sees your blocking. LingBot follows the camera exactly but invents everything
+  the first frame doesn't show: a doorway built off-screen comes back as a different doorway.
+- The ControlNet reads shape, not intent: 1.4 m boxes standing in for cars became concrete planters.
+  Rough-model the things that need to read correctly, or name them in the prompt.
+- Plain image-to-image from `staging.png` doesn't work. FLUX keeps the grey palette and paints fog
+  (strength 0.65), or loses the layout (0.8). Use the depth map.
+- Scale doesn't matter. LingBot normalizes the path's translations, so only the shape of the move
+  counts. `--start`/`--end` pick the frame range; the path is cut to `4k + 1` frames (at least 13).
+
 ## Latency benchmarks
 
 `evaluation/latency/benchmark.py` (component profiles, Table 1) and `apps/lingbot/latency.py`
@@ -308,7 +347,7 @@ is an A/B measured back to back or interleaved, not an absolute benchmark.
   disables them (MPS/CPU, one device).
 - **The image condition stops costing anything after chunk 8** (`LazyImageCondition`). After the
   first image the condition encodes black frames, and the causal VAE encoder converges: latents are
-  bit-identical from latent 30 on at all three sizes. Once a new latent *and* the encoder's whole
+  bit-identical from latent 30 on at all three sizes. Once a new latent _and_ the encoder's whole
   feature cache repeat the previous step bit for bit, the encoder is at a fixed point, and later
   latents are reused without encoding (exactly the same values: 15 chunks with and without the
   shortcut are bit-identical at 832x464, 576x320 and 416x240). From chunk 8 the condition costs
@@ -321,18 +360,18 @@ What's left in a full-cache LingBot chunk is mostly attention (~60%) and GEMMs, 
 
 ## Splitting a chunk with an iPad
 
-Could an iPad Pro share the DiT's work over a cable? Splitting *layers* between devices (exo's
+Could an iPad Pro share the DiT's work over a cable? Splitting _layers_ between devices (exo's
 remote stage) can't help: the passes are sequential, so one device always waits. Splitting a
-chunk's *tokens* (upstream LingBot's 8-GPU layout: each rank runs every layer on its share and
+chunk's _tokens_ (upstream LingBot's 8-GPU layout: each rank runs every layer on its share and
 the ranks exchange K/V once per layer) runs both at once. `scripts/bench_dit_block.py` times one
 DiT block at the demo's shapes; the same benchmark runs on the iPad as `DiTBench.swift` in the
 [exo-touch](https://github.com/eaglstun/exo-touch) app.
 
 | per block | M4 Max, PyTorch MPS (today) | M4 Max, MLX | iPad Pro 11" M5, MLX |
-|---|---|---|---|
-| 832x464 | 174.8 ms | 124.4 ms | 160.4 ms |
-| 576x320 | 39.5 ms | 39.2 ms | 50.2 ms |
-| 416x240 | 17.7 ms | 17.7 ms | 22.9 ms |
+| --------- | --------------------------- | ----------- | -------------------- |
+| 832x464   | 174.8 ms                    | 124.4 ms    | 160.4 ms             |
+| 576x320   | 39.5 ms                     | 39.2 ms     | 50.2 ms              |
+| 416x240   | 17.7 ms                     | 17.7 ms     | 22.9 ms              |
 
 In a short burst the M5's GPU matrix units put it within ~10-25% of the M4 Max; under sustained
 load it settles at about half the Mac (below). The link adds its own cost: an iPad
@@ -346,13 +385,13 @@ FP32 residual and norm statistics, BF16 matmuls, FP32 RoPE rotations). At 832x46
 matches PyTorch to 8.4e-4 relative L2 (largest difference 0.047 on values up to 33, under half a
 BF16 step there) and takes:
 
-| real block 0, 832x464, full cache | per block | DiT per chunk |
-|---|---|---|
-| PyTorch MPS (the demo today) | 144.1 ms | 17.3 s |
-| MLX eager | 136.7 ms (1.05x) | 16.4 s |
-| MLX `mx.compile` | 127.4 ms (1.13x) | 15.3 s |
-| iPad Pro 11" M5, MLX-Swift compiled (`DiTBlockCheck.swift`), burst | 156.8 ms (0.92x) | 18.8 s |
-| the same iPad after ~50 s of GPU load | ~270 ms (~0.53x) | ~32 s |
+| real block 0, 832x464, full cache                                  | per block        | DiT per chunk |
+| ------------------------------------------------------------------ | ---------------- | ------------- |
+| PyTorch MPS (the demo today)                                       | 144.1 ms         | 17.3 s        |
+| MLX eager                                                          | 136.7 ms (1.05x) | 16.4 s        |
+| MLX `mx.compile`                                                   | 127.4 ms (1.13x) | 15.3 s        |
+| iPad Pro 11" M5, MLX-Swift compiled (`DiTBlockCheck.swift`), burst | 156.8 ms (0.92x) | 18.8 s        |
+| the same iPad after ~50 s of GPU load                              | ~270 ms (~0.53x) | ~32 s         |
 
 The iPad's block matches PyTorch to 1.2e-3 relative L2 (max 0.089 on values up to 33, under one
 BF16 step there); eager it takes 209.7 ms, so compiling matters more there than on the Mac.
@@ -379,10 +418,10 @@ One pass on its own (`lingbot_ipad_split.py`'s first version): 4.53 s alone vs 3
 Mac matches the pipeline's bit for bit. A whole world (`scripts/lingbot_ipad_split.py`: Mac alone,
 split, Mac alone again; the two Mac-alone runs are bit-identical):
 
-| 10-chunk world, 832x464 | full-cache chunk (median, chunks 5-9) |
-|---|---|
-| Mac alone (both runs, Photos analysing media part of the time) | 27.3 s |
-| split with the iPad, rebalanced every chunk (its share 38-55%) | 21.6 s (1.26x) |
+| 10-chunk world, 832x464                                        | full-cache chunk (median, chunks 5-9) |
+| -------------------------------------------------------------- | ------------------------------------- |
+| Mac alone (both runs, Photos analysing media part of the time) | 27.3 s                                |
+| split with the iPad, rebalanced every chunk (its share 38-55%) | 21.6 s (1.26x)                        |
 
 The split frames show the same scene and stay clean; their details drift from the Mac's as an
 autoregressive model's do from any small difference (PSNR 43 dB at chunk 0, ~20 dB by chunk 9). In
@@ -426,6 +465,7 @@ Split timings swing ~10% with how hot the iPad is, more than 8-bit could win; a 
 way to measure it.
 
 Two PyTorch 2.9 MPS traps found on the way (both handled in `apps/lingbot/ipad.py`):
+
 - A non-blocking copy of a **non-contiguous** MPS tensor to the CPU comes back wrong (10 of 10
   tries). V, a slice of the fused QKV output, reached the iPad as garbage and every frame after
   chunk 0 went black. `.contiguous()` first.
