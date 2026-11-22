@@ -18,8 +18,9 @@ Writes to ``--out``:
 * ``intrinsics.npy`` -- ``[N, 4]`` fx, fy, cx, cy in pixels of a 480 x 832 frame;
 * ``condition.json`` -- for ``generate.py --condition`` (its image is ``staging.png``;
   pass ``--image`` there to start from the restyled frame instead);
-* ``structure/`` (with ``--structure``) -- every path frame as rendered, for
-  ``generate.py --structure``, which steers each frame with them (SDEdit).
+* ``structure/`` (with ``--structure``) -- every path frame, for ``generate.py --structure``,
+  which steers each frame with them (SDEdit). Rendered shadowless by default (Workbench,
+  studio light, one grey): cast-shadow edges come out of the generation as painted walls.
 
 Without ``--structure`` only the start frame's look reaches LingBot; the camera path is
 followed for every frame either way.
@@ -29,6 +30,7 @@ import argparse
 import json
 import math
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import bpy
@@ -52,6 +54,8 @@ def parse_args():
     parser.add_argument("--no-render", action="store_true", help="export the camera only")
     parser.add_argument("--structure", action="store_true",
                         help="also render every path frame to structure/ (for generate.py --structure)")
+    parser.add_argument("--structure-lighting", choices=("studio", "scene"), default="studio",
+                        help="structure frames: shadowless Workbench studio light (default) or the scene's renderer")
     return parser.parse_args(argv)
 
 
@@ -136,6 +140,34 @@ def disparity_png(exr, png):
     bpy.data.images.remove(out)
 
 
+@contextmanager
+def studio_lighting(scene, enabled):
+    """Workbench, studio light, one grey, no shadows: surfaces shaded by their orientation only.
+
+    Structure frames steer every generated frame, and the generation reads any edge as geometry:
+    with the scene's sun, cast-shadow boundaries came out as painted walls.
+    """
+    if not enabled:
+        yield
+        return
+    shading, view = scene.display.shading, scene.view_settings
+    names = ("light", "color_type", "single_color", "show_shadows", "show_cavity", "show_object_outline",
+             "show_specular_highlight")
+    saved = ({name: getattr(shading, name) for name in names}, scene.render.engine, view.view_transform,
+             view.look)
+    scene.render.engine = "BLENDER_WORKBENCH"
+    shading.light, shading.color_type, shading.single_color = "STUDIO", "SINGLE", (0.8, 0.8, 0.8)
+    shading.show_shadows = shading.show_cavity = shading.show_object_outline = False
+    shading.show_specular_highlight = False
+    view.view_transform, view.look = "Standard", "None"
+    try:
+        yield
+    finally:
+        for name, value in saved[0].items():
+            setattr(shading, name, value)
+        scene.render.engine, view.view_transform, view.look = saved[1:]
+
+
 def render(scene, path):
     scene.render.filepath = str(path)
     bpy.ops.render.render(write_still=True)
@@ -169,13 +201,14 @@ def main():
     settings.image_settings.file_format = "PNG"
     settings.image_settings.color_mode = "RGB"
     render(scene, args.out / "staging.png")
-    if args.structure:  # the path's frames at 16 fps, as seen by the scene's own renderer
-        fps = scene.render.fps / scene.render.fps_base
-        for index in range(len(poses)):
-            frame = start + index * fps / FPS
-            whole = math.floor(frame)
-            scene.frame_set(whole, subframe=frame - whole)
-            render(scene, args.out / "structure" / f"{index:04d}.png")
+    if args.structure:  # the path's frames at 16 fps
+        with studio_lighting(scene, args.structure_lighting == "studio"):
+            fps = scene.render.fps / scene.render.fps_base
+            for index in range(len(poses)):
+                frame = start + index * fps / FPS
+                whole = math.floor(frame)
+                scene.frame_set(whole, subframe=frame - whole)
+                render(scene, args.out / "structure" / f"{index:04d}.png")
         scene.frame_set(start)
 
     # Depth: raw Z into a float EXR (transparent film = sky), then inverse depth as a PNG.
