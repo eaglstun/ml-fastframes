@@ -20,7 +20,8 @@ Writes to ``--out``:
   pass ``--image`` there to start from the restyled frame instead);
 * ``structure/`` (with ``--structure``) -- every path frame, for ``generate.py --structure``,
   which steers each frame with them (SDEdit). Rendered shadowless by default (Workbench,
-  studio light, one grey): cast-shadow edges come out of the generation as painted walls.
+  studio light, one grey, transparent sky): cast-shadow edges come out of the generation as
+  painted walls, and a fixed sky colour skews the recolouring.
 
 Without ``--structure`` only the start frame's look reaches LingBot; the camera path is
 followed for every frame either way.
@@ -145,7 +146,8 @@ def studio_lighting(scene, enabled):
     """Workbench, studio light, one grey, no shadows: surfaces shaded by their orientation only.
 
     Structure frames steer every generated frame, and the generation reads any edge as geometry:
-    with the scene's sun, cast-shadow boundaries came out as painted walls.
+    with the scene's sun, cast-shadow boundaries came out as painted walls. The sky is left
+    transparent (RGBA): ``generate.py --structure`` fills it with the first image's sky colour.
     """
     if not enabled:
         yield
@@ -153,19 +155,22 @@ def studio_lighting(scene, enabled):
     shading, view = scene.display.shading, scene.view_settings
     names = ("light", "color_type", "single_color", "show_shadows", "show_cavity", "show_object_outline",
              "show_specular_highlight")
+    image = scene.render.image_settings
     saved = ({name: getattr(shading, name) for name in names}, scene.render.engine, view.view_transform,
-             view.look)
+             view.look, scene.render.film_transparent, image.color_mode)
     scene.render.engine = "BLENDER_WORKBENCH"
     shading.light, shading.color_type, shading.single_color = "STUDIO", "SINGLE", (0.8, 0.8, 0.8)
     shading.show_shadows = shading.show_cavity = shading.show_object_outline = False
     shading.show_specular_highlight = False
     view.view_transform, view.look = "Standard", "None"
+    scene.render.film_transparent, image.color_mode = True, "RGBA"
     try:
         yield
     finally:
         for name, value in saved[0].items():
             setattr(shading, name, value)
-        scene.render.engine, view.view_transform, view.look = saved[1:]
+        (scene.render.engine, view.view_transform, view.look, scene.render.film_transparent,
+         image.color_mode) = saved[1:]
 
 
 def render(scene, path):

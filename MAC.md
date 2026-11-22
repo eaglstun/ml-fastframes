@@ -251,7 +251,9 @@ brightness, and every frame comes out as grey fog, even at step 1 (6% structure)
 The structure frames are rendered shadowless by default (`--structure-lighting studio`:
 Workbench, studio light, one grey, no shadows), so surfaces read by their orientation alone. With
 the scene's own lighting (`--structure-lighting scene`), the sun's cast-shadow boundaries came out
-of the generation as painted walls.
+of the generation as painted walls. The sky is rendered transparent, and `generate.py` fills it
+with the first image's sky colour: the mean of the first image where the first structure frame has
+no geometry. Night keyframes get a dark sky, day keyframes a blue one.
 
 Same street and seed, from the same keyframe:
 
@@ -260,14 +262,16 @@ Same street and seed, from the same keyframe:
 | pure noise (no structure)  | -               | 4     | 98-105 s            | the grey box only shapes frame 0                                                             |
 | `--structure-step 1` (6%)  | scene           | 3     | 81 s                | as clean as no structure; follows the blocking loosely                                       |
 | `--structure-step 2` (17%) | scene           | 2     | 66 s (+18 s encode) | car-sized boxes become cars where they stand; murkier, brown cast                            |
-| `--structure-step 2`       | studio          | 2     | 86 s with encode    | cars at every box in every frame, clearer streets; still hazy, light sky (see below)          |
+| `--structure-step 2`       | studio          | 2     | 86 s with encode    | cars at every box in every frame, clearer streets; still hazy, light sky (fixed below)        |
+| `--structure-step 2`       | studio, sky fill | 2    | 80 s with encode    | as above with a dark night sky and lit signs; street still a little hazy, cars smudgy         |
 | `--structure-step 3` (38%) | scene           | 1     | 69 s with encode    | traces the blocking exactly but looks painted; shadow edges drawn as walls                   |
 | `--structure-step 3`       | studio          | 1     | 65 s with encode    | clean painted grey box: boxes stay boxes, no shadow walls; no photographic detail            |
 | step 2 without recolouring | scene           | 2     | 58 s                | grey fog                                                                                     |
 
-Step 2 with studio light is the default and the best balance. Step 3 is a painted look: one step
-can paint the layout but not rebuild it. Recolouring matches statistics over the whole frame, so
-the grey box's light sky turns the keyframe's black night sky hazy and bright. A more detailed
+Step 2 with studio light and the sky fill is the default and the best balance. Step 3 is a
+painted look: one step can paint the layout but not rebuild it. Recolouring matches statistics over
+the whole frame, so with a fixed light grey-box sky (before the sky fill) the keyframe's black
+night sky came out hazy and bright. A more detailed
 grey box should help step 2 most, since less is left to invent. Without `--structure`, `step()`
 is unchanged: the video is frame-identical to before.
 
