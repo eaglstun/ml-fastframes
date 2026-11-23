@@ -186,6 +186,16 @@ class LingBotDiT:
         self.cam = [(torch.cat([b.cam_scale_layer.weight, b.cam_shift_layer.weight]).contiguous(),
                      torch.cat([b.cam_scale_layer.bias, b.cam_shift_layer.bias]).contiguous())
                     for b in model.blocks]
+        if device.type != "cuda":
+            # Unified memory: let the blocks' own q/k/v and camera scale/shift weights view the fused
+            # copies above instead of keeping a second copy (0.66 GB; only the fused ones are read).
+            for b, (qkv_w, qkv_b), (cam_w, cam_b) in zip(model.blocks, self.qkv, self.cam):
+                for i, linear in enumerate((b.self_attn.q, b.self_attn.k, b.self_attn.v)):
+                    linear.weight = torch.nn.Parameter(qkv_w[i * dim:(i + 1) * dim], requires_grad=False)
+                    linear.bias = torch.nn.Parameter(qkv_b[i * dim:(i + 1) * dim], requires_grad=False)
+                for i, linear in enumerate((b.cam_scale_layer, b.cam_shift_layer)):
+                    linear.weight = torch.nn.Parameter(cam_w[i * dim:(i + 1) * dim], requires_grad=False)
+                    linear.bias = torch.nn.Parameter(cam_b[i * dim:(i + 1) * dim], requires_grad=False)
         self.gather = [None] * self.layers
         self.feature_gather = self.output_gather = None
         if self.world > 1:

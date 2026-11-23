@@ -111,10 +111,12 @@ def main():
     for c in range(args.chunks):
         print(f"{c:5d} {alone_times[c]:6.2f}s {split_times[c]:6.2f}s {again_times[c]:6.2f}s {shares[c]:10.0%}  "
               f"{psnr(split[c], alone[c]):17.1f} dB", flush=True)
-    steady = slice(5, None)  # full cache
+    first = 5 if args.chunks > 5 else 0  # full-cache chunks; all of them in a short run
+    steady = slice(first, None)
     alone_median = statistics.median(alone_times[steady] + again_times[steady])
     split_median = statistics.median(split_times[steady])
-    print(f"full-cache chunks (5+): Mac alone median {alone_median:.2f} s, split {split_median:.2f} s "
+    print(f"{'full-cache chunks (5+)' if first else 'all chunks (no full-cache chunk)'}: "
+          f"Mac alone median {alone_median:.2f} s, split {split_median:.2f} s "
           f"({alone_median / split_median:.2f}x); the Mac waited {waited / max(passes, 1):.2f} s per pass "
           f"for the iPad's K/V; the iPad ended {thermal}")
 
