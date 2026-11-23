@@ -8,7 +8,8 @@
 > **This fork adds Apple Silicon (MPS) support for FastFrames-S text-to-video and the LingBot
 > camera-control demo.** On an M4 Max, T2V takes ~45-50 s per 81-frame 480p video with ~18 GB peak
 > memory. The LingBot demo makes each 1 s turn in ~12-25 s at 832x464 with a rough preview after
-> ~4-6 s, or in ~5-6 s with a preview in under 2 s at `--size 576x320` (lower fidelity). See
+> ~4-6 s, or in ~5-6 s with a preview in under 2 s at `--size 576x320` (lower fidelity). LingBot
+> can also turn a [Blender grey box](#from-a-blender-grey-box) into video along its camera path. See
 > [Apple Silicon](#apple-silicon-mps) and [MAC.md](MAC.md). Everything else is upstream
 > [apple-aiml-research/ml-fastframes](https://github.com/apple-aiml-research/ml-fastframes) and
 > still targets Linux + NVIDIA.
@@ -81,6 +82,58 @@ The single-device [latency benchmarks](MAC.md#latency-benchmarks) run too: one F
 Training, multi-GPU runs, the baseline latency rows, and FastFrames-L (14B, doesn't fit in 64 GB
 without offloading) are not ported. [MAC.md](MAC.md) lists every change and why, including the
 Metal flash-attention kernel used for attention on MPS.
+
+### From a Blender grey box
+
+Block out a scene in Blender with untextured boxes, animate a camera through it, and LingBot flies
+the same path through a photoreal version. `apps/lingbot/blender_stage.py` exports the camera path
+as LingBot conditioning, plus a depth map for the first frame and a render of every frame for
+steering.
+
+![The test scene in Blender: a grey-box village street with the camera path in orange](docs/assets/blender_overview.jpg)
+
+`scripts/greybox_village.py` builds the test scene above. It's a village street opening onto a
+plaza, and the camera (orange) walks up the road for 5 s. Then:
+
+1. **Export** (4 s): `blender_stage.py --structure` writes the camera path, `depth.png` and every
+   frame of the path as a grey render.
+2. **Keyframe** (~4 min): any depth ControlNet turns `depth.png` into a real first frame. These
+   examples use FLUX.1-dev with Union Pro 2.0 in Draw Things.
+3. **Video** (~2 min for 77 frames): `generate.py --image keyframe.png` follows the camera path.
+   Add `--structure` to steer every frame by the grey renders, not just the first.
+
+```bash
+/Applications/Blender.app/Contents/MacOS/Blender -b --python scripts/greybox_village.py -- village.blend
+/Applications/Blender.app/Contents/MacOS/Blender -b village.blend --python apps/lingbot/blender_stage.py -- \
+    --out outputs/village --structure --prompt "A sunny Mediterranean village street ..."
+# keyframe.png from outputs/village/depth.png with a depth ControlNet (see MAC.md)
+.venv/bin/python apps/lingbot/generate.py --model lingbot-1.3b --lingbot-root upstream/lingbot-world-v2 \
+    --condition outputs/village/condition.json --image keyframe.png \
+    --structure outputs/village/structure --output outputs/village.mp4
+```
+
+![Grey box, depth map, FLUX keyframe and a LingBot --structure frame](docs/assets/blender_stages.jpg)
+
+[![Grey box, LingBot from the keyframe only, and LingBot with --structure, side by side](docs/assets/blender_steering_preview.gif)](docs/assets/blender_steering.mp4)
+
+Left to right:
+
+- **The grey box.**
+- **LingBot from the keyframe only.** Sharp and sunny, but past the first frame it invents the
+  street, and it only partly follows the walk.
+- **LingBot with `--structure`.** Windows, balconies, awnings and lamps stay where they were
+  modelled, but the frames come out washed out.
+
+What to expect:
+
+- **A depth map loses small parts.** In it, a car is just a box and the wheels disappear, so FLUX
+  turned the cars into stone planters. `--structure` keeps whatever the keyframe drew.
+- **Model recesses, not panels.** Flat windows shade exactly like the wall in the grey renders
+  and vanish. Cut them in.
+
+[MAC.md](MAC.md#from-a-blender-grey-box) has the details: the full commands, every
+`--structure-step` setting with a night street for comparison, the shadowless lighting and the
+sky fill.
 
 #### TODO: speed and memory on Apple Silicon
 
