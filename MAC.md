@@ -275,6 +275,36 @@ night sky came out hazy and bright. A more detailed
 grey box should help step 2 most, since less is left to invent. Without `--structure`, `step()`
 is unchanged: the video is frame-identical to before.
 
+#### A detailed daytime scene
+
+`scripts/greybox_village.py` builds a more detailed test scene: a village street opening onto a
+plaza, with windows and doors cut 0.3 m into the walls, shutters, sills, balconies, awnings, parked
+cars with wheels, lamps, trees, a fountain and a church tower. The camera walks up the road for 5 s.
+In studio light, windows modelled as flat panels on the wall shade like the wall, so they need
+recesses: the side faces (reveals) are what show up.
+
+```bash
+/Applications/Blender.app/Contents/MacOS/Blender -b --python scripts/greybox_village.py -- village.blend
+/Applications/Blender.app/Contents/MacOS/Blender -b village.blend --python apps/lingbot/blender_stage.py -- \
+    --out outputs/village --structure --prompt "A sunny Mediterranean village street ..."
+```
+
+The keyframe (FLUX.1-dev + Union Pro depth, as above, 230 s) is a sunny whitewashed street, but the
+cars came out as stone planters again: in a depth map a car is a box, and the wheels don't read.
+Same keyframe and seed, 77 frames:
+
+| Start                     | Video, end to end | Result                                                                                                                              |
+| ------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| pure noise (no structure) | 136 s             | sharpest and sunniest; keeps the keyframe's planters; the walk and the late pan left come through weakly                            |
+| `--structure-step 2`      | 114 s             | windows, balconies, awnings and lamps where the grey box puts them, blue sky; planters stay planters; washed out, low contrast      |
+| `--structure-step 3`      | 101 s             | traces the grey box exactly, cars with wheels; painted; the left facades come out dark grey because the studio light shades them so |
+
+The sky fill works in daylight: both structure runs have a blue sky. The extra detail helps step 2
+with placement (every balcony and awning lands where it was modelled), not with the haze. Where the
+keyframe and the grey box disagree (planters against cars), step 2 keeps the keyframe and step 3
+takes the grey box. So model what matters for the keyframe too: a depth map can't show wheels, and
+the keyframe decides what step 2 draws.
+
 ## Latency benchmarks
 
 `evaluation/latency/benchmark.py` (component profiles, Table 1) and `apps/lingbot/latency.py`

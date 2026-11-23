@@ -82,6 +82,24 @@ Training, multi-GPU runs, the baseline latency rows, and FastFrames-L (14B, does
 without offloading) are not ported. [MAC.md](MAC.md) lists every change and why, including the
 Metal flash-attention kernel used for attention on MPS.
 
+#### TODO: speed and memory on Apple Silicon
+
+The cheap wins are taken (LingBot peaks at ~27 GB; a chunk's DiT is ~80% of its time, its attention
+and FFN kernels near peak, the glue between them ~12%). What's left, roughly by expected payoff:
+
+- [ ] **Fewer denoising steps.** Start LingBot chunks at step 2 or 3 of the 4-step schedule
+      (as `--structure` already does). Cuts DiT time a lot, but quality has to be measured.
+- [ ] **A faster attention kernel.** Attention is ~60% of a DiT block. Beating the current Metal
+      flash kernel is real work and may not pay off.
+- [ ] **8-bit DiT weights.** The next big memory cut after the ~27 GB peak. Frames are no
+      longer bit-identical, so it's a quality trade-off.
+- [ ] **iPad split: `--kv-bits 8`.** Halves the K/V on the USB link; untested beyond A/B noise
+      because the iPad's GPU throttles under sustained load, which caps the split at ~1.26x.
+- [ ] **Fuse the glue ops** (norms, modulation, residuals) in a DiT block: at most a few percent.
+- [ ] **`--structure` haze.** Step 2 follows a detailed grey box but comes out washed out, by day
+      and by night ([MAC.md](MAC.md#a-detailed-daytime-scene)). Recolouring per region instead of over
+      the whole frame is one idea.
+
 ## Latency Profiling
 
 ```bash
