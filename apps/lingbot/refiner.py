@@ -137,7 +137,11 @@ class KVRefiner:
         self.streams = ([torch.cuda.Stream(device=device) for _ in self.heads]
                         if len(self.heads) > 1 and device.type == "cuda" else [])
         self.local_tokens = TOKENS // world
-        self.local = torch.empty(2, layers, self.local_tokens, dim, device=device, dtype=torch.bfloat16)
+        # Off CUDA on one device the refined K/V go straight into the cache slot (``_refine``): no
+        # 1.1 GB staging buffer and no second copy. CUDA keeps the upstream staging + compiled commit.
+        self.direct = world == 1 and device.type != "cuda"
+        self.local = (None if self.direct else
+                      torch.empty(2, layers, self.local_tokens, dim, device=device, dtype=torch.bfloat16))
         self.gathered = (torch.empty(world, 2, layers, self.local_tokens, dim, device=device, dtype=torch.bfloat16)
                          if world > 1 else None)
         self.pool = torch.cuda.graph_pool_handle() if graphs else None
@@ -148,10 +152,15 @@ class KVRefiner:
         self.cache_k[:, :, end - TOKENS:end].copy_(key.reshape(shape))
         self.cache_v[:, :, end - TOKENS:end].copy_(value.reshape(shape))
 
-    def _refine(self, head, first, last, phi, lo, hi):
+    def _refine(self, head, first, last, phi, lo, hi, read_frames):
         kr, vr = head(self.k[first:last, lo:hi], self.v[first:last, lo:hi], phi)
         heads = self.cache_k.shape[-2]
         physical = self.rotate(kr.reshape(last - first, self.local_tokens, heads, -1), self.rope[lo:hi])
+        if self.direct:
+            end = read_frames * FRAME_TOKENS
+            self.cache_k[first:last, 0, end - TOKENS:end].copy_(physical)
+            self.cache_v[first:last, 0, end - TOKENS:end].copy_(vr.reshape(physical.shape))
+            return
         self.local[0, first:last].copy_(physical.reshape(last - first, self.local_tokens, self.dim))
         self.local[1, first:last].copy_(vr)
 
@@ -165,12 +174,15 @@ class KVRefiner:
                 for group, (head, stream) in enumerate(zip(self.heads, self.streams)):
                     stream.wait_stream(caller)
                     with torch.cuda.stream(stream):
-                        self._refine(head, group * self.count, (group + 1) * self.count, phi, lo, hi)
+                        self._refine(head, group * self.count, (group + 1) * self.count, phi, lo, hi,
+                                     read_frames)
                 for stream in self.streams:
                     caller.wait_stream(stream)
             else:
                 for group, head in enumerate(self.heads):  # sequential head groups off CUDA
-                    self._refine(head, group * self.count, (group + 1) * self.count, phi, lo, hi)
+                    self._refine(head, group * self.count, (group + 1) * self.count, phi, lo, hi, read_frames)
+            if self.direct:
+                return
             if self.world > 1:
                 dist.all_gather_into_tensor(self.gathered.view(-1, self.local_tokens, self.dim),
                                             self.local.view(-1, self.local_tokens, self.dim))

@@ -257,16 +257,16 @@ no geometry. Night keyframes get a dark sky, day keyframes a blue one.
 
 Same street and seed, from the same keyframe:
 
-| Start                      | Structure light | Steps | Video (77 frames)   | Result                                                                                       |
-| -------------------------- | --------------- | ----- | ------------------- | -------------------------------------------------------------------------------------------- |
-| pure noise (no structure)  | -               | 4     | 98-105 s            | the grey box only shapes frame 0                                                             |
-| `--structure-step 1` (6%)  | scene           | 3     | 81 s                | as clean as no structure; follows the blocking loosely                                       |
-| `--structure-step 2` (17%) | scene           | 2     | 66 s (+18 s encode) | car-sized boxes become cars where they stand; murkier, brown cast                            |
-| `--structure-step 2`       | studio          | 2     | 86 s with encode    | cars at every box in every frame, clearer streets; still hazy, light sky (fixed below)        |
-| `--structure-step 2`       | studio, sky fill | 2    | 80 s with encode    | as above with a dark night sky and lit signs; street still a little hazy, cars smudgy         |
-| `--structure-step 3` (38%) | scene           | 1     | 69 s with encode    | traces the blocking exactly but looks painted; shadow edges drawn as walls                   |
-| `--structure-step 3`       | studio          | 1     | 65 s with encode    | clean painted grey box: boxes stay boxes, no shadow walls; no photographic detail            |
-| step 2 without recolouring | scene           | 2     | 58 s                | grey fog                                                                                     |
+| Start                      | Structure light  | Steps | Video (77 frames)   | Result                                                                                 |
+| -------------------------- | ---------------- | ----- | ------------------- | -------------------------------------------------------------------------------------- |
+| pure noise (no structure)  | -                | 4     | 98-105 s            | the grey box only shapes frame 0                                                       |
+| `--structure-step 1` (6%)  | scene            | 3     | 81 s                | as clean as no structure; follows the blocking loosely                                 |
+| `--structure-step 2` (17%) | scene            | 2     | 66 s (+18 s encode) | car-sized boxes become cars where they stand; murkier, brown cast                      |
+| `--structure-step 2`       | studio           | 2     | 86 s with encode    | cars at every box in every frame, clearer streets; still hazy, light sky (fixed below) |
+| `--structure-step 2`       | studio, sky fill | 2     | 80 s with encode    | as above with a dark night sky and lit signs; street still a little hazy, cars smudgy  |
+| `--structure-step 3` (38%) | scene            | 1     | 69 s with encode    | traces the blocking exactly but looks painted; shadow edges drawn as walls             |
+| `--structure-step 3`       | studio           | 1     | 65 s with encode    | clean painted grey box: boxes stay boxes, no shadow walls; no photographic detail      |
+| step 2 without recolouring | scene            | 2     | 58 s                | grey fog                                                                               |
 
 Step 2 with studio light and the sky fill is the default and the best balance. Step 3 is a
 painted look: one step can paint the layout but not rebuild it. Recolouring matches statistics over
@@ -397,6 +397,37 @@ is an A/B measured back to back or interleaved, not an absolute benchmark.
 
 What's left in a full-cache LingBot chunk is mostly attention (~60%) and GEMMs, which run at
 12.4-14.2 TFLOPS (MPS's own matmul), close to what this GPU does.
+
+A later per-component profile of full-size chunks agrees. The DiT is ~80% of a chunk; the image
+condition costs 3.6 s per chunk until chunk 8, then 0; the KV refiner takes 0.5 s, the pixel decoder
+0.2 s, and everything else 0.45 s. Inside one full-cache block, self-attention is 60%, the FFN 18%,
+and the QKV/cross/output GEMMs ~13%. All the elementwise glue together (norms, RoPE, modulation,
+gates, cache write) is ~12%, so fusing it could win a few percent at most. Committing the
+command buffer after every block (sync or `Event().record()`) changed nothing beyond the noise.
+
+### Memory: -3.3 GB peak, bit-identical frames
+
+A 141-frame `generate.py` run went from 30.6 to 27.3 GB of peak system memory: available memory at
+the start minus its lowest point, run under a watchdog. The frames are byte-identical (framemd5),
+and so are the 576x320 size-toggle rebuild (`parts()`) and the iPad split (the two Mac-alone runs).
+Speed is unchanged within the noise.
+
+- **The first chunk's image condition grew the allocator cache by ~17 GB.** The Wan VAE encoder's
+  full-size FP32 activations (~0.6-0.9 GB each at 96 channels x 4 frames x 464 x 832) change
+  frame count from latent to latent: 1 for the first image, then 4, plus cached frames. Freed
+  blocks rarely fit the next request, so the cache piled up and was still held while chunk 0's DiT
+  ran: the process peak. It was the same with native `conv3d`. `LazyImageCondition` and
+  `encode_structure` now release the MPS cache after each latent: same latents, same 3.3-3.9 s per
+  chunk.
+- **The KV refiner writes straight into the cache slot** off CUDA on one device, instead of staging
+  the refined K/V in a 1.1 GB buffer and copying it over (`refiner.direct`).
+- **The DiT's blocks view their fused Q/K/V and camera weights** instead of keeping second copies
+  (0.66 GB). Only the fused ones (`LingBotDiT.qkv` / `.cam`) were ever read, including by the iPad
+  split.
+
+Measured with `torch.mps.driver_allocated_memory()` and `footprint`: the steady-state driver holds
+17.9 GB instead of 20.0 GB. The process footprint runs ~4-7 GB above the driver number, mostly MPS's
+own per-shape graph state, which `empty_cache()` can't return.
 
 ## Splitting a chunk with an iPad
 

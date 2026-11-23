@@ -30,6 +30,8 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
+from fastframes.device import release_mps_cache
+
 __all__ = ["HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH", "CHUNK", "DEFAULT_INTRINSICS", "DEFAULT_SIZE",
            "parse_size", "set_size",
            "text_context", "image_condition", "LazyImageCondition", "encode_structure", "sky_color", "recolor", "latent_count", "Trajectory", "LiveCamera",
@@ -182,8 +184,10 @@ def encode_structure(vae, images, latents, device, first_image=None):
     video = torch.stack(pixels, dim=1)[None]  # [1, 3, frames, H, W]
     vae.model.clear_cache()
     encoded = [_encode_latent(vae, video[:, :, :1], device)]
+    release_mps_cache(device)  # see LazyImageCondition._encode_next
     for start in range(1, count, 4):
         encoded.append(_encode_latent(vae, video[:, :, start:start + 4], device))
+        release_mps_cache(device)
     vae.model.clear_cache()
     return torch.cat(encoded, dim=1)
 
@@ -254,6 +258,10 @@ class LazyImageCondition:
         else:
             self._previous_cache = None
         self.encoded.append(latent)
+        # MPS: the encoder's full-size FP32 activations differ in frame count from latent to latent
+        # (1, then 4 plus cached frames), so freed blocks rarely fit the next request and the
+        # allocator's cache grew by ~17 GB over the first chunk, still held while its DiT ran.
+        release_mps_cache(self.device)
 
     def chunk(self, c):
         """``[20, 4, 58, 104]`` condition of latent frames ``[4c, 4c + 4)``."""
