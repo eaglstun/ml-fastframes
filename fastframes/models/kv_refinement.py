@@ -169,12 +169,15 @@ class GroupedKVRepairHeads(nn.Module):
         self.gemms = nn.ModuleList([GroupGEMM(num_blocks, dim, d_a, d_a, d_a, num_heads, head_dim, mlp_mult)])
         self.phi_proj = nn.ModuleDict({str(d_a): nn.Linear(d_a, d_a, bias=False)})
 
-    def forward(self, nK_all, nV_all, phi, e):
-        """nK_all, nV_all: ``[L, S, dim]``; phi: ``[1, S, d_a]`` or ``[S, d_a]``."""
+    def forward(self, nK_all, nV_all, phi, e, layers=slice(None)):
+        """nK_all, nV_all: ``[L, S, dim]``; phi: ``[1, S, d_a]`` or ``[S, d_a]``.
+
+        ``layers`` selects which layers the ``L`` inputs are (default: all of them, in order).
+        """
         phi2 = phi[0] if phi.dim() == 3 else phi
         gemm = self.gemms[0]
-        phi_v = self.phi_proj[str(gemm.d_v)](phi2).unsqueeze(0).expand(self.num_blocks, -1, -1)
-        return gemm(nK_all, nV_all, phi_v, e)
+        phi_v = self.phi_proj[str(gemm.d_v)](phi2).unsqueeze(0).expand(nK_all.shape[0], -1, -1)
+        return gemm(nK_all, nV_all, phi_v, e, layers=layers)
 
 
 class KVRefinementNetwork(nn.Module):
@@ -215,8 +218,8 @@ class KVRefinementNetwork(nn.Module):
             x = block(x, e)
         return self.stem_norm(x)
 
-    def repair_all(self, nK_all, nV_all, phi, e):
-        return self.heads_grouped(nK_all, nV_all, phi, e)
+    def repair_all(self, nK_all, nV_all, phi, e, layers=slice(None)):
+        return self.heads_grouped(nK_all, nV_all, phi, e, layers=layers)
 
     @property
     def repaired_block_indices(self) -> List[int]:
