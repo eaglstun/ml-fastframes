@@ -37,6 +37,47 @@ SDPA about 2/3 of the time was self-attention over the growing KV cache (up to 3
 rest is GEMMs, which run at ~13 TFLOPS bf16 here, about 100x below a B200. bf16 is slightly faster
 than fp16 on M4. Interactive latency isn't reachable on this hardware; batch T2V works fine.
 
+## FastFrames-L (14B): short clips
+
+FastFrames-L runs at full bf16 precision for clips of up to 41 frames (2.5 s). It needs the
+`fastframes-l/` weights (30.7 GB) and Wan2.1-14B's umT5 encoder and tokenizer, which are the same
+files the LingBot 14B folder holds, so a link saves the 69 GB Wan snapshot:
+
+```bash
+$HF download apple/FastFrames-L --include 'fastframes-l/*' --local-dir checkpoints
+# umT5 + tokenizer: from Wan-AI/Wan2.1-T2V-14B, or link the LingBot copies (docs/installation.md#lingbot)
+mkdir -p checkpoints/Wan2.1-T2V-14B/google
+ln -s ../lingbot-world-v2-14b-causal-fast/models_t5_umt5-xxl-enc-bf16.pth checkpoints/Wan2.1-T2V-14B/
+ln -s ../../lingbot-world-v2-14b-causal-fast/google/umt5-xxl checkpoints/Wan2.1-T2V-14B/google/
+FASTFRAMES_MPS_MEMORY_FRACTION=0.95 .venv/bin/python scripts/generate.py --model ff-l \
+    --prompt "A corgi surfing a wave at sunset" --seed 0 --frames 41 --output outputs/corgi_l.mp4
+```
+
+| M4 Max, 64 GB, 41 frames | FastFrames-S | FastFrames-L          |
+| ------------------------ | -----------: | --------------------: |
+| rollout + decode         |       17.5 s | 139 s (~12.6 s/frame) |
+| end to end, with load    |            - |                 174 s |
+| memory left (of ~37 GB)  |      12.5 GB |                7.5 GB |
+
+At the same prompt and seed, FastFrames-L draws a recognisable corgi where FastFrames-S draws a dark
+silhouette on a board.
+
+Where the memory goes, and what changed to fit it (all off CUDA only; FastFrames-S output is
+byte-identical to before):
+
+| Part                                     |    Size | Change                                                                 |
+| ---------------------------------------- | ------: | ---------------------------------------------------------------------- |
+| DiT weights, bf16                        | 28.6 GB | `.safetensors` load straight to MPS: loading to CPU and moving held 57 GB |
+| KV cache, 40 layers x 1,560 tokens/frame | 1.3 GB/frame | `--frames` sizes it to the clip: 14.1 GB at 41 frames, 26.8 GB at 81 |
+| FastOps fused QKV (FF-L's `fast_ops`)    |  6.3 GB | skipped off CUDA (a second copy of q/k/v, and slower on MPS)           |
+| umT5 encoder                             |   11 GB | dropped after encoding; moving it to CPU still held it in unified memory |
+| KV refiner + pixel decoder               |  2.1 GB | -                                                                      |
+
+`--frames` (1 + 4k, up to 81) stops the rollout early. The noise is still drawn for 81 frames, so
+a short clip is exactly the start of the full one (checked with FastFrames-S: the 41-frame video
+equals the first 41 frames of the 81-frame one). 49 frames would add 2.5 GB and land on the memory
+guard's floor. All 81 frames need ~13 GB more: an 8-bit KV cache or 8-bit DiT weights.
+
 ## Metal flash-attention kernel
 
 On MPS, attention runs in a custom Metal compute kernel (`fastframes/wan/mps_flash_attention.py`,
@@ -590,7 +631,6 @@ Two PyTorch 2.9 MPS traps found on the way (both handled in `apps/lingbot/ipad.p
 | T5 built with random FP32 init (48 s, 22 GB RAM) before loading bf16 weights                                                                                            | Built on the meta device and assigned the checkpoint (same result)                                                                         |
 | OpenH264 binary is linux64-only (ctypes)                                                                                                                                | Non-Linux `save_video` uses ffmpeg/libx264, BT.601 limited range, faststart                                                                |
 
-Not ported: training (NCCL, Triton flex_attention, CUDA RNG state), FastFrames-L (14B: ~28 GB DiT
-
-- ~26 GB KV cache + T5 does not fit in 64 GB without offloading), multi-device LingBot
-  (`--gpus 8`, torchrun), and the multi-GPU and baseline latency rows.
+Not ported: training (NCCL, Triton flex_attention, CUDA RNG state), full-length FastFrames-L (81
+frames need a 26.8 GB KV cache next to the 28.6 GB DiT; [short clips run](#fastframes-l-14b-short-clips)),
+multi-device LingBot (`--gpus 8`, torchrun), and the multi-GPU and baseline latency rows.
