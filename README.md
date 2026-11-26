@@ -102,41 +102,48 @@ plaza, and the camera (orange) walks up the road for 5 s. Then:
    frame of the path as a grey render.
 2. **Keyframe** (~4 min): any depth ControlNet turns `depth.png` into a real first frame. These
    examples use FLUX.1-dev with Union Pro 2.0 in Draw Things.
-3. **Video** (~2 min for 77 frames): `generate.py --image keyframe.png` follows the camera path.
-   Add `--structure` to steer every frame by the grey renders, not just the first.
+3. **Project** (37 s): export again with `--project keyframe.png`. The structure frames now show
+   the keyframe projected onto the scene from the start camera, instead of grey.
+4. **Video** (~1.5 min for 77 frames): `generate.py --image keyframe.png` follows the camera path,
+   and `--structure` steers every frame with the projected renders, not just the first.
 
 ```bash
 /Applications/Blender.app/Contents/MacOS/Blender -b --python scripts/greybox_village.py -- village.blend
 /Applications/Blender.app/Contents/MacOS/Blender -b village.blend --python apps/lingbot/blender_stage.py -- \
     --out outputs/village --structure --prompt "A sunny Mediterranean village street ..."
 # keyframe.png from outputs/village/depth.png with a depth ControlNet (see MAC.md)
+/Applications/Blender.app/Contents/MacOS/Blender -b village.blend --python apps/lingbot/blender_stage.py -- \
+    --out outputs/village --project keyframe.png --prompt "A sunny Mediterranean village street ..."
 .venv/bin/python apps/lingbot/generate.py --model lingbot-1.3b --lingbot-root upstream/lingbot-world-v2 \
     --condition outputs/village/condition.json --image keyframe.png \
     --structure outputs/village/structure --output outputs/village.mp4
 ```
 
-![Grey box, depth map, FLUX keyframe and a LingBot --structure frame](docs/assets/blender_stages.jpg)
+![Grey box, depth map, FLUX keyframe and a LingBot frame steered by the projected keyframe](docs/assets/blender_stages.jpg)
 
-[![Grey box, LingBot from the keyframe only, and LingBot with --structure, side by side](docs/assets/blender_steering_preview.gif)](docs/assets/blender_steering.mp4)
+[![Grey box, LingBot from the keyframe only, and LingBot steered by the projected keyframe, side by side](docs/assets/blender_steering_preview.gif)](docs/assets/blender_steering.mp4)
 
 Left to right:
 
 - **The grey box.**
 - **LingBot from the keyframe only.** Sharp and sunny, but past the first frame it invents the
   street, and it only partly follows the walk.
-- **LingBot with `--structure`.** Windows, balconies, awnings and lamps stay where they were
-  modelled, but the frames come out washed out.
+- **LingBot with `--structure` and `--project`.** It follows the grey box's layout and the walk,
+  and keeps the keyframe's look. Steered by plain grey renders, the frames came out washed out.
 
 What to expect:
 
 - **A depth map loses small parts.** In it, a car is just a box and the wheels disappear, so FLUX
   turned the cars into stone planters. `--structure` keeps whatever the keyframe drew.
+- **Projection has no occlusion test.** Surfaces hidden in the first frame take the colours of
+  whatever covered them, and nearby ground smears as the camera passes over it. The default
+  `--structure-step 2` repaints those; step 3 keeps them.
 - **Model recesses, not panels.** Flat windows shade exactly like the wall in the grey renders
   and vanish. Cut them in.
 
 [MAC.md](MAC.md#from-a-blender-grey-box) has the details: the full commands, every
-`--structure-step` setting with a night street for comparison, the shadowless lighting and the
-sky fill.
+`--structure-step` setting with a night street for comparison, the haze measurements, the
+shadowless lighting and the sky fill.
 
 #### TODO: speed and memory on Apple Silicon
 
@@ -153,9 +160,8 @@ and FFN kernels near peak, the glue between them ~12%). What's left, roughly by 
 - [ ] **iPad split: `--kv-bits 8`.** Halves the K/V on the USB link; untested beyond A/B noise
       because the iPad's GPU throttles under sustained load, which caps the split at ~1.26x.
 - [ ] **Fuse the glue ops** (norms, modulation, residuals) in a DiT block: at most a few percent.
-- [ ] **`--structure` haze.** Step 2 follows a detailed grey box but comes out washed out, by day
-      and by night ([MAC.md](MAC.md#a-detailed-daytime-scene)). Recolouring per region instead of over
-      the whole frame is one idea.
+- [x] **`--structure` haze.** Fixed by projecting the keyframe onto the scene (`blender_stage.py
+  --project`); [MAC.md](MAC.md#projecting-the-keyframe---project) has the measurements.
 
 ## Latency Profiling
 

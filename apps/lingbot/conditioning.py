@@ -34,7 +34,8 @@ from fastframes.device import release_mps_cache
 
 __all__ = ["HEIGHT", "WIDTH", "LATENT_HEIGHT", "LATENT_WIDTH", "CHUNK", "DEFAULT_INTRINSICS", "DEFAULT_SIZE",
            "parse_size", "set_size",
-           "text_context", "image_condition", "LazyImageCondition", "encode_structure", "sky_color", "recolor", "latent_count", "Trajectory", "LiveCamera",
+           "text_context", "image_condition", "LazyImageCondition", "encode_structure", "sky_color", "match_tone",
+           "latent_count", "Trajectory", "LiveCamera",
            "KeyboardCamera", "ACTIONS"]
 
 HEIGHT, WIDTH = 464, 832
@@ -164,6 +165,20 @@ def _structure_pixels(image, sky):
     return F.interpolate(rgb.sub_(0.5).div_(0.5)[None], size=(HEIGHT, WIDTH), mode="bicubic")[0]
 
 
+def match_tone(pixels, reference):
+    """``pixels`` ``[3, H, W]`` with each RGB channel's mean and std matched to ``reference``'s, in [-1, 1].
+
+    Gives a flat grey structure render the first image's palette and contrast. Without it, the grey
+    survives the noise of the structure start as its colour and brightness (frames come out as grey
+    fog). Matching per latent channel instead (after encoding) narrowed the decoded target's tonal
+    range (2nd-98th percentile luminance 0.58 -> 0.51, keyframe 0.75) and every frame came out hazy;
+    matched in pixels it is 0.72.
+    """
+    mean, std = pixels.mean(dim=(1, 2), keepdim=True), pixels.std(dim=(1, 2), keepdim=True)
+    ref_mean, ref_std = reference.mean(dim=(1, 2), keepdim=True), reference.std(dim=(1, 2), keepdim=True)
+    return ((pixels - mean) / (std + 1e-6) * ref_std + ref_mean).clamp_(-1, 1)
+
+
 def encode_structure(vae, images, latents, device, first_image=None):
     """Structure video (PIL frames at 16 fps, e.g. a grey-box render of the camera path) ->
     ``[16, latents, 58, 104]`` latents for ``FastFramesLingBot.step(structure=...)``.
@@ -172,15 +187,22 @@ def encode_structure(vae, images, latents, device, first_image=None):
     (encoding a long video in one call corrupts the last latent on MPS). Needs the first
     ``4 * (latents - 1) + 1`` frames. Run it before ``start()``, which resets the encoder cache.
 
-    Frames with a transparent sky (``blender_stage.py --structure``) get the sky colour of
-    ``first_image`` (``sky_color``): a fixed backdrop colour pulls ``recolor``'s whole-frame
-    statistics toward it, e.g. a light grey-box sky turned a black night sky hazy and bright.
+    With ``first_image`` (always, from ``generate.py``) every frame takes its palette and contrast
+    first (``match_tone``), and frames with a transparent sky (``blender_stage.py --structure``) get
+    its sky colour (``sky_color``): a fixed backdrop colour skews the matched statistics, e.g. a
+    light grey-box sky turned a black night sky hazy and bright.
     """
     count = 4 * (latents - 1) + 1
     if len(images) < count:
         raise ValueError(f"{latents} latent frames need {count} structure frames, got {len(images)}")
     sky = sky_color(first_image, images[0]) if first_image is not None else None
     pixels = [_structure_pixels(image, sky) for image in images[:count]]
+    if first_image is not None:
+        from torchvision.transforms import functional as TF
+
+        reference = TF.to_tensor(first_image.convert("RGB")).sub_(0.5).div_(0.5)
+        reference = F.interpolate(reference[None], size=(HEIGHT, WIDTH), mode="bicubic")[0]
+        pixels = [match_tone(frame, reference) for frame in pixels]
     video = torch.stack(pixels, dim=1)[None]  # [1, 3, frames, H, W]
     vae.model.clear_cache()
     encoded = [_encode_latent(vae, video[:, :, :1], device)]
@@ -190,18 +212,6 @@ def encode_structure(vae, images, latents, device, first_image=None):
         release_mps_cache(device)
     vae.model.clear_cache()
     return torch.cat(encoded, dim=1)
-
-
-def recolor(latents, reference):
-    """Match every latent frame's per-channel mean and std to ``reference`` ``[16, 1, h, w]``.
-
-    A flat grey structure render survives the noise of the structure start as its colour and
-    brightness (frames come out as grey fog); matched to the first image's statistics, it
-    keeps its shapes and takes the first image's palette.
-    """
-    mean, std = latents.mean(dim=(2, 3), keepdim=True), latents.std(dim=(2, 3), keepdim=True)
-    ref_mean, ref_std = reference.mean(dim=(2, 3), keepdim=True), reference.std(dim=(2, 3), keepdim=True)
-    return (latents - mean) / (std + 1e-6) * ref_std + ref_mean
 
 
 class LazyImageCondition:
