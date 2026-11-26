@@ -122,7 +122,10 @@ class FastFrames:
         self.scheduler = FlowMatchScheduler(shift=5.0)
         height, width = config.latent_size
         self.frame_tokens = height * width // 4
-        self.fast = FastOps(dit, height, width, config.num_frames) if config.fast_ops else None
+        # Off CUDA, skip FastOps: its fused QKV weights are a second copy of q/k/v (6.3 GB for the
+        # 14B DiT) and measured slower on MPS than the separate GEMMs.
+        use_fast = config.fast_ops and self.device.type == "cuda"
+        self.fast = FastOps(dit, height, width, config.num_frames) if use_fast else None
         self._time = {}
         self._refine_embedding = None
 
@@ -130,8 +133,11 @@ class FastFrames:
     def from_pretrained(cls, config, wan_dir, dit, refiner, decoder, *, device=None):
         """Build from checkpoint paths (or already-loaded state dicts)."""
         device = device or default_device()
+        # On MPS, load .safetensors straight to the device (one copy instead of CPU + device).
+        load_device = device if torch.device(device).type == "mps" else "cpu"
+
         def state(value, key=None):
-            return value if isinstance(value, dict) else load_state_dict(value, key)
+            return value if isinstance(value, dict) else load_state_dict(value, key, device=load_device)
 
         dit = build_wan(config.wan_model, state(dit, "generator_ema"), device=device)
         wan = WAN_CONFIGS[config.wan_model]
@@ -213,23 +219,30 @@ class FastFrames:
 
     # ------------------------------------------------------------------ rollout
     @torch.inference_mode()
-    def rollout(self, prompt_embeds, seed, context="refiner"):
+    def rollout(self, prompt_embeds, seed, context="refiner", num_frames=None):
         """Latents ``[1, F, 16, h, w]``, decoder features ``[1, F*L, C]`` and modulation ``[1, F, 1, C]``.
 
         ``context`` selects what the next frames attend to for each finished frame:
         ``"refiner"`` (FastFrames) repairs the cache slot with the KV refinement network
         after frame 0's clean DiT pass at ``t = 0``; ``"dit"`` runs that clean pass for
         every frame (Causal Forcing++).
+
+        ``num_frames`` (default: the recipe's 21) stops the rollout early and sizes the KV cache to
+        it. The noise is drawn for the full length, so a short rollout is the start of the full one.
         """
         if context not in CONTEXT_MODES:
             raise ValueError(f"context must be one of {CONTEXT_MODES}")
         cfg = self.config
+        num_frames = num_frames or cfg.num_frames
+        if not 1 <= num_frames <= cfg.num_frames:
+            raise ValueError(f"num_frames must be in [1, {cfg.num_frames}]")
         with self.autocast():
             noise, transition = self._noise(seed)
+            noise = noise[:, :num_frames]
             text_cache = self.dit.text_cache(prompt_embeds)
-            kv_cache = allocate_kv_cache(self.dit, cfg.num_frames, self.frame_tokens, device=self.device)
+            kv_cache = allocate_kv_cache(self.dit, num_frames, self.frame_tokens, device=self.device)
             latents, features, modulation = torch.empty_like(noise), [], []
-            for frame in range(cfg.num_frames):
+            for frame in range(num_frames):
                 schedule = cfg.first_frame_timesteps if frame == 0 else cfg.timesteps
                 x = noise[:, frame:frame + 1]
                 for step, timestep in enumerate(schedule):
@@ -254,16 +267,16 @@ class FastFrames:
 
     @torch.inference_mode()
     def decode(self, features, modulation):
-        """Pixels ``[1, 81, 3, 480, 832]`` in ``[-1, 1]``."""
+        """Pixels ``[1, 81, 3, 480, 832]`` in ``[-1, 1]`` (``1 + 4 * (F - 1)`` frames for ``F`` latent frames)."""
         height, width = self.config.latent_size
         grid = torch.tensor([[modulation.shape[1], height // 2, width // 2]], device=self.device, dtype=torch.long)
         with torch.autocast(self.device.type, dtype=torch.bfloat16):
             pixels = self.decoder(features, modulation, grid)
-        return align_frames(pixels, self.config.num_pixel_frames)
+        return align_frames(pixels, 1 + 4 * (modulation.shape[1] - 1))
 
-    def generate(self, prompt: str, seed: int, prompt_embeds: Optional[torch.Tensor] = None):
-        """Returns ``[81, 480, 832, 3]`` uint8 frames."""
+    def generate(self, prompt: str, seed: int, prompt_embeds: Optional[torch.Tensor] = None, num_frames=None):
+        """Returns ``[81, 480, 832, 3]`` uint8 frames (``1 + 4 * (num_frames - 1)`` for a short rollout)."""
         if prompt_embeds is None:
             prompt_embeds = self.encode_prompt(prompt)
-        _, features, modulation = self.rollout(prompt_embeds, seed)
+        _, features, modulation = self.rollout(prompt_embeds, seed, num_frames=num_frames)
         return to_uint8(self.decode(features, modulation)[0]).cpu()
