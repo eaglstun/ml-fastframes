@@ -24,7 +24,7 @@ from .device import default_device
 from .checkpoints import build_wan, load_state_dict
 from .models.kv_refinement import KVRefinementNetwork
 from .models.pixel_decoder import BridgedPixelDecoder, PixelDecoder, align_frames
-from .wan.causal_model import FastOps, allocate_kv_cache
+from .wan.causal_model import FastOps, QuantizedKV, allocate_kv_cache, kv_read, kv_write
 from .wan.model import WAN_CONFIGS
 from .wan.scheduler import FlowMatchScheduler
 from .wan.text_encoder import TextEncoder
@@ -209,17 +209,31 @@ class FastFrames:
         if self.config.contiguous_stem:
             stem = stem.contiguous()
         phi = self.refiner.compute_phi(stem.to(torch.bfloat16), emb)
-        keys = torch.stack([c["k"][:, start:end].reshape(self.frame_tokens, -1) for c in kv_cache])
-        values = torch.stack([c["v"][:, start:end].reshape(self.frame_tokens, -1) for c in kv_cache])
+        if isinstance(kv_cache[0]["k"], QuantizedKV):
+            # An int8 cache is for tight memory: refine 10 layers at a time. All 40 of FastFrames-L's
+            # at once need ~5 GB of scratch, which put its 81-frame run over a 64 GB Mac's limit.
+            shape = (1, self.frame_tokens, self.dit.num_heads, self.dit.dim // self.dit.num_heads)
+            for first in range(0, len(kv_cache), 10):
+                group = kv_cache[first:first + 10]
+                keys = torch.stack([kv_read(c["k"], start, end).reshape(self.frame_tokens, -1) for c in group])
+                values = torch.stack([kv_read(c["v"], start, end).reshape(self.frame_tokens, -1) for c in group])
+                keys, values = self.refiner.repair_all(keys, values, phi, emb,
+                                                       layers=slice(first, first + len(group)))
+                for c, key, value in zip(group, keys, values):
+                    kv_write(c["k"], start, end, key.reshape(shape))
+                    kv_write(c["v"], start, end, value.reshape(shape))
+            return
+        keys = torch.stack([kv_read(c["k"], start, end).reshape(self.frame_tokens, -1) for c in kv_cache])
+        values = torch.stack([kv_read(c["v"], start, end).reshape(self.frame_tokens, -1) for c in kv_cache])
         keys, values = self.refiner.repair_all(keys, values, phi, emb)
+        shape = (1, self.frame_tokens, self.dit.num_heads, self.dit.dim // self.dit.num_heads)
         for index in self.refiner.repaired_block_indices:
-            slot = kv_cache[index]["k"][:, start:end]
-            kv_cache[index]["k"][:, start:end].copy_(keys[index].reshape(slot.shape).to(slot.dtype))
-            kv_cache[index]["v"][:, start:end].copy_(values[index].reshape(slot.shape).to(slot.dtype))
+            kv_write(kv_cache[index]["k"], start, end, keys[index].reshape(shape))
+            kv_write(kv_cache[index]["v"], start, end, values[index].reshape(shape))
 
     # ------------------------------------------------------------------ rollout
     @torch.inference_mode()
-    def rollout(self, prompt_embeds, seed, context="refiner", num_frames=None):
+    def rollout(self, prompt_embeds, seed, context="refiner", num_frames=None, kv_bits=16):
         """Latents ``[1, F, 16, h, w]``, decoder features ``[1, F*L, C]`` and modulation ``[1, F, 1, C]``.
 
         ``context`` selects what the next frames attend to for each finished frame:
@@ -229,6 +243,8 @@ class FastFrames:
 
         ``num_frames`` (default: the recipe's 21) stops the rollout early and sizes the KV cache to
         it. The noise is drawn for the full length, so a short rollout is the start of the full one.
+        ``kv_bits=8`` stores the cache as int8 (:class:`QuantizedKV`): half the memory, slightly
+        different frames.
         """
         if context not in CONTEXT_MODES:
             raise ValueError(f"context must be one of {CONTEXT_MODES}")
@@ -240,7 +256,10 @@ class FastFrames:
             noise, transition = self._noise(seed)
             noise = noise[:, :num_frames]
             text_cache = self.dit.text_cache(prompt_embeds)
-            kv_cache = allocate_kv_cache(self.dit, num_frames, self.frame_tokens, device=self.device)
+            if kv_bits not in (8, 16):
+                raise ValueError("kv_bits must be 8 or 16")
+            kv_cache = allocate_kv_cache(self.dit, num_frames, self.frame_tokens, device=self.device,
+                                         quantize=kv_bits == 8)
             latents, features, modulation = torch.empty_like(noise), [], []
             for frame in range(num_frames):
                 schedule = cfg.first_frame_timesteps if frame == 0 else cfg.timesteps
@@ -274,9 +293,10 @@ class FastFrames:
             pixels = self.decoder(features, modulation, grid)
         return align_frames(pixels, 1 + 4 * (modulation.shape[1] - 1))
 
-    def generate(self, prompt: str, seed: int, prompt_embeds: Optional[torch.Tensor] = None, num_frames=None):
+    def generate(self, prompt: str, seed: int, prompt_embeds: Optional[torch.Tensor] = None, num_frames=None,
+                 kv_bits=16):
         """Returns ``[81, 480, 832, 3]`` uint8 frames (``1 + 4 * (num_frames - 1)`` for a short rollout)."""
         if prompt_embeds is None:
             prompt_embeds = self.encode_prompt(prompt)
-        _, features, modulation = self.rollout(prompt_embeds, seed, num_frames=num_frames)
+        _, features, modulation = self.rollout(prompt_embeds, seed, num_frames=num_frames, kv_bits=kv_bits)
         return to_uint8(self.decode(features, modulation)[0]).cpu()

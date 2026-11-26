@@ -76,15 +76,14 @@ by shot, and the page shows a rough preview of the chunk ~4-6 s in. Add `--size 
 model was trained at 832x464. Setup, measurements and the changes are in
 [MAC.md](MAC.md#lingbot-camera-control-interactive-demo).
 
-FastFrames-L (14B) makes clips of up to 41 frames (2.5 s) at full precision: `--frames 41`,
-~2.3 min each on the M4 Max (FastFrames-S: 17.5 s). Its KV cache for all 81 frames doesn't fit next
-to the 28.6 GB DiT in 64 GB. Setup and numbers are in [MAC.md](MAC.md#fastframes-l-14b-short-clips).
+FastFrames-L (14B) runs too: all 81 frames with an 8-bit KV cache (`--kv-bits 8`) in ~6.4 min on
+the M4 Max, or clips of up to 41 frames at full precision (`--frames 41`, ~3 min). FastFrames-S
+takes 40 s. Setup and numbers are in [MAC.md](MAC.md#fastframes-l-14b).
 
 The single-device [latency benchmarks](MAC.md#latency-benchmarks) run too: one FastFrames-S step
 (4 frames) takes ~3.2 s on the M4 Max (35.4 ms on a B200), and one LingBot chunk ~26 s.
 
-Training, multi-GPU runs, the baseline latency rows, and full-length (81-frame) FastFrames-L are not
-ported. [MAC.md](MAC.md) lists every change and why, including the
+Training, multi-GPU runs, and the baseline latency rows are not ported. [MAC.md](MAC.md) lists every change and why, including the
 Metal flash-attention kernel used for attention on MPS.
 
 ### From a Blender grey box
@@ -144,9 +143,7 @@ sky fill.
 The cheap wins are taken (LingBot peaks at ~27 GB; a chunk's DiT is ~80% of its time, its attention
 and FFN kernels near peak, the glue between them ~12%). What's left, roughly by expected payoff:
 
-- [ ] **FastFrames-L at 81 frames.** Short clips run; all 81 frames need ~13 GB more. An 8-bit KV
-  cache (dequantized in the Metal flash kernel) saves 13 GB; 8-bit DiT weights save 14 GB but change
-  the frames.
+- [x] **FastFrames-L at 81 frames.** Done with an int8 KV cache (`--kv-bits 8`).
 - [ ] **Fewer denoising steps.** Start LingBot chunks at step 2 or 3 of the 4-step schedule
       (as `--structure` already does). Cuts DiT time a lot, but quality has to be measured.
 - [ ] **A faster attention kernel.** Attention is ~60% of a DiT block. Beating the current Metal

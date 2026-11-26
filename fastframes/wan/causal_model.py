@@ -20,7 +20,8 @@ from .model import (
     sinusoidal_embedding_1d,
 )
 
-__all__ = ["CausalWanModel", "FastOps", "allocate_kv_cache", "frame_causal_mask"]
+__all__ = ["CausalWanModel", "FastOps", "QuantizedKV", "allocate_kv_cache", "frame_causal_mask", "kv_read",
+           "kv_write"]
 
 _FLEX_PAD = 128
 
@@ -69,14 +70,70 @@ def frame_causal_mask(num_frames, frame_tokens, teacher_forcing=False, device="c
                              _compile=False, device=device)
 
 
-def allocate_kv_cache(model, num_frames, frame_tokens, batch_size=1, dtype=torch.bfloat16, device="cuda"):
-    """Per-layer self-attention cache ``{"k", "v"}`` of shape ``[B, F*frame_tokens, H, D]``."""
+class QuantizedKV:
+    """A K or V cache stored as int8, with one FP32 scale per token and head (absmax over head_dim).
+
+    Half the memory of BF16: FastFrames-L's 81-frame cache drops from 26.8 GB to 13.4 GB (+0.4 GB
+    of scales), which makes the full length fit next to its 28.6 GB DiT on a 64 GB Mac. Attention
+    reads a dequantized BF16 copy of the layer's prefix, one layer at a time.
+    """
+
+    def __init__(self, shape, device):
+        self.shape = shape
+        self.data = torch.zeros(shape, dtype=torch.int8, device=device)
+        self.scale = torch.zeros((*shape[:-1], 1), dtype=torch.float32, device=device)
+
+    def store(self, start, end, x):
+        x = x.float()
+        scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 127.0
+        self.data[:, start:end].copy_((x / scale).round_().clamp_(-127, 127).to(torch.int8))
+        self.scale[:, start:end].copy_(scale)
+
+    def load(self, start, end, out=None):
+        """BF16 ``[B, end - start, H, D]`` (into ``out`` if given)."""
+        values = (self.data[:, start:end].to(torch.float16) * self.scale[:, start:end].to(torch.float16))
+        if out is None:
+            return values.to(torch.bfloat16)
+        return out.copy_(values)
+
+
+def allocate_kv_cache(model, num_frames, frame_tokens, batch_size=1, dtype=torch.bfloat16, device="cuda",
+                      quantize=False):
+    """Per-layer self-attention cache ``{"k", "v"}`` of shape ``[B, F*frame_tokens, H, D]``.
+
+    ``quantize`` stores each as a :class:`QuantizedKV` (int8) instead of a ``dtype`` tensor.
+    """
     shape = (batch_size, num_frames * frame_tokens, model.num_heads, model.dim // model.num_heads)
+    if quantize:
+        return [{"k": QuantizedKV(shape, device), "v": QuantizedKV(shape, device)} for _ in range(model.num_layers)]
     return [
         {"k": torch.zeros(shape, dtype=dtype, device=device),
          "v": torch.zeros(shape, dtype=dtype, device=device)}
         for _ in range(model.num_layers)
     ]
+
+
+def kv_write(slot, start, end, x):
+    """Write tokens ``[start, end)`` of a cache tensor or :class:`QuantizedKV`."""
+    if isinstance(slot, QuantizedKV):
+        slot.store(start, end, x)
+    else:
+        slot[:, start:end].copy_(x.to(slot.dtype))
+
+
+def kv_read(slot, start, end):
+    """Tokens ``[start, end)`` of a cache tensor (a view) or :class:`QuantizedKV` (dequantized BF16)."""
+    return slot.load(start, end) if isinstance(slot, QuantizedKV) else slot[:, start:end]
+
+
+def _attended(slot, start, end, current):
+    """The ``[0, end)`` keys or values a frame attends to: the cached prefix plus its own ``current``
+    tokens at full precision (a quantized cache only compresses the context)."""
+    out = torch.empty((*slot.shape[:1], end, *slot.shape[2:]), dtype=current.dtype, device=current.device)
+    if start:
+        slot.load(0, start, out=out[:, :start])
+    out[:, start:end].copy_(current)
+    return out
 
 
 def rope_real(x, table):
@@ -217,9 +274,16 @@ class CausalWanAttentionBlock(WanAttentionBlock):
             q = rope_real(sa.norm_q(q).view(shape), fast.rope[frame])
             k = rope_real(sa.norm_k(k).view(shape), fast.rope[frame])
             v = v.view(shape)
-        kv_cache["k"][:, start:end].copy_(k)
-        kv_cache["v"][:, start:end].copy_(v)
-        y = sa.o(attention(q, kv_cache["k"][:, :end], kv_cache["v"][:, :end]).flatten(2))
+        if isinstance(kv_cache["k"], QuantizedKV):
+            kv_cache["k"].store(start, end, k)
+            kv_cache["v"].store(start, end, v)
+            keys, values = _attended(kv_cache["k"], start, end, k), _attended(kv_cache["v"], start, end, v)
+            y = sa.o(attention(q, keys, values).flatten(2))
+            del keys, values
+        else:
+            kv_cache["k"][:, start:end].copy_(k)
+            kv_cache["v"][:, start:end].copy_(v)
+            y = sa.o(attention(q, kv_cache["k"][:, :end], kv_cache["v"][:, :end]).flatten(2))
         x = x + (y.unflatten(1, (1, tokens)) * e[2]).flatten(1, 2)
         x = x + self.cross_attn(self.norm3(x), None, cache=cross_kv)
         y = self.ffn((self.norm2(x).unflatten(1, (1, tokens)) * (1 + e[4]) + e[3]).flatten(1, 2))

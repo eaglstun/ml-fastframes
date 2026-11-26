@@ -49,6 +49,8 @@ def main():
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--frames", type=int, default=81,
                         help="video frames, 1 + 4k up to 81; fewer stop the rollout early with a smaller KV cache")
+    parser.add_argument("--kv-bits", type=int, choices=(8, 16), default=16,
+                        help="KV cache precision; 8 halves its memory (FastFrames-L at 81 frames on a 64 GB Mac)")
     args = parser.parse_args()
     if args.frames % 4 != 1 or not 1 <= args.frames <= 81:
         parser.error("--frames must be 1 + 4k, at most 81")
@@ -76,7 +78,8 @@ def main():
         torch.mps.empty_cache()
     for prompt, seed, path in jobs:
         start = time.perf_counter()
-        frames = model.generate(prompt, seed, prompt_embeds=embeds.get(prompt), num_frames=latent_frames)
+        frames = model.generate(prompt, seed, prompt_embeds=embeds.get(prompt), num_frames=latent_frames,
+                                kv_bits=args.kv_bits)
         save_video(path, frames)
         print(f"{path}  seed={seed}  {time.perf_counter() - start:.1f}s", flush=True)
 
