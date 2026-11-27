@@ -156,8 +156,14 @@ and FFN kernels near peak, the glue between them ~12%). What's left, roughly by 
       `--steps 0,1,2,3` runs all four. `0,3` is 32% faster but hazy
       ([MAC.md](MAC.md#fewer-denoising-steps---steps)). The last step has to stay: the decoder and
       refiner were trained on its features.
-- [ ] **A faster attention kernel.** Attention is ~60% of a DiT block. Beating the current Metal
-      flash kernel is real work and may not pay off.
+- [x] **Reuse the image condition.** Until chunk 8, each LingBot chunk spent ~4 s re-encoding the
+      black frames of its VAE image condition. Off CUDA, later chunks now reuse the first chunk's
+      last latent: 18-23% faster 157-frame videos, no visible change (`--exact-condition` restores
+      upstream's encode; [MAC.md](MAC.md#reusing-the-image-condition---exact-condition-to-turn-off)).
+- [ ] **A faster attention kernel.** Attention is ~60% of a DiT block. Probably at the ceiling:
+      PyTorch 2.15's MPS SDPA, a separate implementation, lands on the same speed as our Metal kernel.
+- [x] **A shorter KV window.** Measured, not worth it: 14 of 18 latent frames saves less than
+      run-to-run noise, and 10 makes the scene drift.
 - [x] **8-bit DiT weights.** Done for FastFrames-S and -L (`--dit-bits 8`,
       [MAC.md](MAC.md#int8-dit-weights---dit-bits-8)). Not worth it for LingBot: its DiT is 1.7B
       parameters (3.2 GiB in bf16), so int8 would save ~1.3 GiB of the ~27 GB peak and change

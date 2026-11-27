@@ -171,11 +171,15 @@ class FastFramesLingBot:
 
     # ------------------------------------------------------------------ session
     @torch.inference_mode()
-    def start(self, image, prompt, *, seed=0, latents=240, noise="clip"):
+    def start(self, image, prompt, *, seed=0, latents=240, noise="clip", exact_condition=None):
         """Begin a video from a PIL ``image`` and ``prompt`` with a horizon of ``latents`` latent frames.
 
         The image condition is encoded chunk by chunk as it is needed (same values as upstream's
-        whole-horizon encoding, see ``LazyImageCondition``). ``noise="clip"``
+        whole-horizon encoding, see ``LazyImageCondition``). Off CUDA (``exact_condition=None``
+        or ``False``) only the first chunk's condition is encoded and later chunks reuse its last
+        latent, which the encoder's black-frame latents converge to: no visible change, ~4 s less
+        per chunk at 832x464 until the encoder's fixed point at latent 29. On CUDA, or with
+        ``exact_condition=True``, every chunk is encoded as upstream does. ``noise="clip"``
         draws the initial noise of the whole horizon at the start (upstream), ``"chunk"`` draws
         it chunk by chunk; both then draw three transition noises per chunk.
         """
@@ -187,7 +191,10 @@ class FastFramesLingBot:
                                               keep=self.device.type == "cuda"))
             self.prompt = prompt
             release_mps_cache(self.device)  # umT5 (11 GB) left the GPU; return its blocks
-        self.condition = LazyImageCondition(self.upstream.vae, image, latents, self.device)
+        if exact_condition is None:
+            exact_condition = self.device.type == "cuda"  # cheap there; keep upstream's values
+        self.condition = LazyImageCondition(self.upstream.vae, image, latents, self.device,
+                                            reuse_after=None if exact_condition else CHUNK)
         self.latents = latents
         self.restart(seed=seed, noise=noise)
 

@@ -229,9 +229,14 @@ class LazyImageCondition:
     feature cache are both bit-identical to the previous step's, the encoder is at a fixed point
     (same state, same zero input), so every later latent equals the last one and is reused without
     encoding: exactly the same values, ~1 s of VAE work per latent saved (~4 s per chunk on MPS).
+
+    The fixed point doesn't depend on the image, and the latents approach it quickly (0.6% away
+    by latent 8, 0.01% by latent 17, at 832 x 464). ``reuse_after=n`` stops encoding after ``n``
+    latents and repeats the last one, an approximation that skips the ~28 s of encoder work up
+    to the fixed point; ``None`` encodes until the fixed point (exact).
     """
 
-    def __init__(self, vae, image, latents, device):
+    def __init__(self, vae, image, latents, device, reuse_after=None):
         from torchvision.transforms import functional as TF
 
         if abs(image.width * HEIGHT / (image.height * WIDTH) - 1) > 0.05:
@@ -239,6 +244,7 @@ class LazyImageCondition:
         pixels = TF.to_tensor(image.convert("RGB")).sub_(0.5).div_(0.5)
         self.first = F.interpolate(pixels[None], size=(HEIGHT, WIDTH), mode="bicubic").transpose(0, 1)[None]
         self.vae, self.latents, self.device = vae, latents, torch.device(device)
+        self.reuse_after = reuse_after
         self.encoded = []  # latent frames [16, 1, 58, 104] in order
         self.steady = False  # the encoder reached its fixed point: later latents repeat the last one
         self._previous_cache = None  # feature cache after the previous latent, kept once outputs repeat
@@ -253,6 +259,9 @@ class LazyImageCondition:
 
     def _encode_next(self):
         model, index = self.vae.model, len(self.encoded)
+        if not self.steady and self.reuse_after is not None and index >= self.reuse_after:
+            self.steady, self._previous_cache = True, None
+            model.clear_cache()  # never encodes again: free the feature cache now
         if self.steady:
             self.encoded.append(self.encoded[-1])
             return

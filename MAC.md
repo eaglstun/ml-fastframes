@@ -58,11 +58,11 @@ FASTFRAMES_MPS_MEMORY_FRACTION=0.95 .venv/bin/python scripts/generate.py --model
 # add --dit-bits 8 for int8 DiT weights: 3-5 GB more headroom at the same speed
 ```
 
-| M4 Max, 64 GB            | FastFrames-S, 81 | FastFrames-L, 41, bf16 KV | FastFrames-L, 81, int8 KV | FastFrames-L, 41, int8 DiT | FastFrames-L, 81, int8 DiT + KV |
-| ------------------------ | ---------------: | ------------------------: | ------------------------: | -------------------------: | ------------------------------: |
-| rollout + decode         |             40 s |                     139 s |     332 s (~15.8 s/frame) |                      126 s |                           310 s |
-| end to end, with load    |                - |                     174 s |                     384 s |                          - |                               - |
-| memory left at the low point | ~13 GB       |                    7.5 GB |                    6.7 GB |                    13.0 GB |                         11.4 GB |
+| M4 Max, 64 GB                | FastFrames-S, 81 | FastFrames-L, 41, bf16 KV | FastFrames-L, 81, int8 KV | FastFrames-L, 41, int8 DiT | FastFrames-L, 81, int8 DiT + KV |
+| ---------------------------- | ---------------: | ------------------------: | ------------------------: | -------------------------: | ------------------------------: |
+| rollout + decode             |             40 s |                     139 s |     332 s (~15.8 s/frame) |                      126 s |                           310 s |
+| end to end, with load        |                - |                     174 s |                     384 s |                          - |                               - |
+| memory left at the low point |           ~13 GB |                    7.5 GB |                    6.7 GB |                    13.0 GB |                         11.4 GB |
 
 Run to run, these times vary by about 10%: the 81-frame int8-KV run took 325 s on the day of the
 int8 DiT runs, with 8.0 GB left.
@@ -73,14 +73,14 @@ silhouette on a board.
 Where the memory goes, and what changed to fit it (all off CUDA only; FastFrames-S output is
 byte-identical to before):
 
-| Part                                     |    Size | Change                                                                 |
-| ---------------------------------------- | ------: | ---------------------------------------------------------------------- |
-| DiT weights, bf16                        | 28.6 GB | `.safetensors` load straight to MPS: loading to CPU and moving held 57 GB; `--dit-bits 8`: 13.5 GiB, quantized as the file streams in |
-| KV cache, 40 layers x 1,560 tokens/frame | 1.3 GB/frame | `--frames` sizes it to the clip; `--kv-bits 8` halves it: 13.8 GB at 81 frames instead of 26.8 GB |
-| KV refiner scratch, all 40 layers at once | ~5 GB  | with `--kv-bits 8`, 10 layers at a time                                |
-| FastOps fused QKV (FF-L's `fast_ops`)    |  6.3 GB | skipped off CUDA (a second copy of q/k/v, and slower on MPS)           |
-| umT5 encoder                             |   11 GB | dropped after encoding; moving it to CPU still held it in unified memory |
-| KV refiner + pixel decoder               |  2.1 GB | the refiner is built on `meta` and takes the loaded tensors, so it isn't held twice while loading |
+| Part                                      |         Size | Change                                                                                                                                |
+| ----------------------------------------- | -----------: | ------------------------------------------------------------------------------------------------------------------------------------- |
+| DiT weights, bf16                         |      28.6 GB | `.safetensors` load straight to MPS: loading to CPU and moving held 57 GB; `--dit-bits 8`: 13.5 GiB, quantized as the file streams in |
+| KV cache, 40 layers x 1,560 tokens/frame  | 1.3 GB/frame | `--frames` sizes it to the clip; `--kv-bits 8` halves it: 13.8 GB at 81 frames instead of 26.8 GB                                     |
+| KV refiner scratch, all 40 layers at once |        ~5 GB | with `--kv-bits 8`, 10 layers at a time                                                                                               |
+| FastOps fused QKV (FF-L's `fast_ops`)     |       6.3 GB | skipped off CUDA (a second copy of q/k/v, and slower on MPS)                                                                          |
+| umT5 encoder                              |        11 GB | dropped after encoding; moving it to CPU still held it in unified memory                                                              |
+| KV refiner + pixel decoder                |       2.1 GB | the refiner is built on `meta` and takes the loaded tensors, so it isn't held twice while loading                                     |
 
 `--frames` (1 + 4k, up to 81) stops the rollout early. The noise is still drawn for 81 frames, so
 a short clip is exactly the start of the full one (checked with FastFrames-S: the 41-frame video
@@ -97,10 +97,10 @@ in the 81-frame run.
 
 What the int8 cache does to the frames, against the BF16 cache at the same seed:
 
-| Run                        | PSNR (average, last frame) | What you see                                                              |
-| -------------------------- | -------------------------: | ------------------------------------------------------------------------- |
-| FastFrames-L, 41 frames    |           38.8 dB, 34.2 dB | no visible difference                                                     |
-| FastFrames-S, 81 frames    |           24.4 dB, 21.8 dB | same scene and quality, the motion diverges (the dog turns away or stays) |
+| Run                     | PSNR (average, last frame) | What you see                                                              |
+| ----------------------- | -------------------------: | ------------------------------------------------------------------------- |
+| FastFrames-L, 41 frames |           38.8 dB, 34.2 dB | no visible difference                                                     |
+| FastFrames-S, 81 frames |           24.4 dB, 21.8 dB | same scene and quality, the motion diverges (the dog turns away or stays) |
 
 FastFrames-S drifts more over its 21 autoregressive frames, and the low PSNR measures that drift, not
 worse frames: judge those runs by looking. The 81-frame FastFrames-L run's first 41 frames are
@@ -124,11 +124,11 @@ repeated calls are bit-identical.
 
 What int8 weights do to the frames, against bf16 weights at the same seed (per-frame PSNR):
 
-| Run                                 | mean, first, last frame | What you see                                                       |
-| ----------------------------------- | ----------------------: | ------------------------------------------------------------------ |
-| FastFrames-L, 41 frames             |    22.9, 26.5, 20.8 dB | same corgi, pose and framing; wave and sun details differ          |
-| FastFrames-L, 81 frames, int8 KV both |  22.1, 26.5, 22.4 dB | same as above, all the way to frame 80                             |
-| FastFrames-S, 81 frames             |    22.9, 28.0, 23.2 dB | same scene and quality, the motion diverges as with the int8 cache |
+| Run                                   | mean, first, last frame | What you see                                                       |
+| ------------------------------------- | ----------------------: | ------------------------------------------------------------------ |
+| FastFrames-L, 41 frames               |     22.9, 26.5, 20.8 dB | same corgi, pose and framing; wave and sun details differ          |
+| FastFrames-L, 81 frames, int8 KV both |     22.1, 26.5, 22.4 dB | same as above, all the way to frame 80                             |
+| FastFrames-S, 81 frames               |     22.9, 28.0, 23.2 dB | same scene and quality, the motion diverges as with the int8 cache |
 
 Unlike the int8 cache, int8 weights change every frame from the first, so PSNR is lower even where
 the videos look equivalent. Runs repeat byte for byte. The memory saving doesn't remove
@@ -307,12 +307,12 @@ trained, and its frames are byte-identical to the code before `--steps`.
 
 Examples 00 and 03, seed 0, 61 frames (4 chunks) at 832x464, M4 Max:
 
-| `--steps` | DiT passes | scene 00, 4 chunks | detail, range (scene 00) | detail, range (scene 03) | look                                                         |
-| --------- | ---------: | -----------------: | -----------------------: | -----------------------: | ------------------------------------------------------------ |
-| 0,1,2,3   |          4 |             74.4 s |              0.0245, 0.85 |             0.0257, 0.78 | the model as trained                                         |
-| 0,2,3     |          3 |             67.3 s |              0.0227, 0.81 |                        - | a little softer and hazier than 0,1,3                        |
-| **0,1,3** |      **3** |         **65.3 s** |          **0.0246, 0.82** |         **0.0265, 0.79** | as sharp as four steps; same scene and camera path           |
-| 0,3       |          2 |             50.5 s |              0.0227, 0.82 |             0.0230, 0.68 | soft and hazy: washed-out distance, milky water in scene 03  |
+| `--steps` | DiT passes | scene 00, 4 chunks | detail, range (scene 00) | detail, range (scene 03) | look                                                        |
+| --------- | ---------: | -----------------: | -----------------------: | -----------------------: | ----------------------------------------------------------- |
+| 0,1,2,3   |          4 |             74.4 s |             0.0245, 0.85 |             0.0257, 0.78 | the model as trained                                        |
+| 0,2,3     |          3 |             67.3 s |             0.0227, 0.81 |                        - | a little softer and hazier than 0,1,3                       |
+| **0,1,3** |      **3** |         **65.3 s** |         **0.0246, 0.82** |         **0.0265, 0.79** | as sharp as four steps; same scene and camera path          |
+| 0,3       |          2 |             50.5 s |             0.0227, 0.82 |             0.0230, 0.68 | soft and hazy: washed-out distance, milky water in scene 03 |
 
 Detail is the mean absolute Laplacian of luminance and range the 2nd-98th luminance percentile
 spread (as in [the haze measurements](#projecting-the-keyframe---project)), over frames 13-60. Each
@@ -327,6 +327,47 @@ from 8.0 s to 6.6 s: at the smaller size the DiT passes are a larger share of th
 
 The demo's rough previews come after the first two passes run, so with the default three passes
 the page shows "preview 1 of 3" and "2 of 3".
+
+### Reusing the image condition (`--exact-condition` to turn off)
+
+Every chunk's DiT input includes an image condition: the Wan VAE's encoding of the first image
+followed by black frames, one latent per four frames (`LazyImageCondition`). The causal encoder
+only reaches its fixed point at latent 29, so until chunk 8 each chunk spent ~4 s at 832x464
+(~0.97 s per latent) re-encoding black frames: ~20% of a full-size chunk. The black-frame latents
+converge fast, and to the same values for any image:
+
+| latent | distance from the fixed point | scene 00 vs scene 03 |
+| -----: | ----------------------------: | -------------------: |
+|      3 |                          7.9% |                 5.3% |
+|      8 |                          0.6% |                 0.2% |
+|     17 |                         0.01% |               0.002% |
+|  29-on |                 0 (identical) |        0 (identical) |
+
+Off CUDA, LingBot now encodes the first chunk's condition and repeats its last latent for every
+later chunk. `--exact-condition` on `generate.py` and `demo.py` encodes all of them as upstream
+does, byte-identical to before. CUDA keeps upstream's behaviour by default; the encode is cheap
+there.
+
+157 frames (10 chunks), seed 0, M4 Max:
+
+| run                       |              total | chunks 1-7, each | detail, range |
+| ------------------------- | -----------------: | ---------------: | ------------: |
+| scene 00, 832x464, exact  |            175.0 s |      12.4-19.8 s | 0.0219, 0.785 |
+| scene 00, 832x464, reused | **133.9 s (-23%)** |   **8.5-14.7 s** | 0.0224, 0.792 |
+| scene 03, 832x464, exact  |            184.3 s |      14.4-20.8 s | 0.0223, 0.845 |
+| scene 03, 832x464, reused | **151.5 s (-18%)** |   **9.9-16.2 s** | 0.0265, 0.878 |
+| scene 00, 576x320, exact  |             64.9 s |        5.6-6.7 s |               |
+| scene 00, 576x320, reused |  **51.8 s (-20%)** |    **3.7-4.9 s** |               |
+
+Chunks 0 and 8-9 take the same time either way. Each video takes its own path through the scene
+from chunk 1 on (as with `--steps`, PSNR can't judge it), and the frames look the same. Reusing
+latent 7 instead (two chunks encoded) saved less (8-15%) and looked no different. The demo
+already encoded the next chunk's condition between turns, so there the saving shows when the
+player acts within ~2 s of seeing the frames.
+
+Shrinking the KV cache window was measured too, and isn't worth it: 14 latent frames instead of
+18 saves less than run-to-run noise, and 10 (2 sink frames) saves ~3 s per full chunk but the scene
+drifts and the rider changes.
 
 ### From a Blender grey box
 
@@ -431,7 +472,7 @@ Same keyframe and seed, 77 frames:
 | Start                     | Video, end to end | Result                                                                                                                              |
 | ------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | pure noise (no structure) | 136 s             | sharpest and sunniest; keeps the keyframe's planters; the walk and the late pan left come through weakly                            |
-| `--structure-step 2`      | 114 s             | windows, balconies, awnings and lamps where the grey box puts them, blue sky; planters stay planters; washed out (fixed below)       |
+| `--structure-step 2`      | 114 s             | windows, balconies, awnings and lamps where the grey box puts them, blue sky; planters stay planters; washed out (fixed below)      |
 | `--structure-step 3`      | 101 s             | traces the grey box exactly, cars with wheels; painted; the left facades come out dark grey because the studio light shades them so |
 
 The sky fill works in daylight: both structure runs have a blue sky. The extra detail helps step 2
@@ -445,13 +486,13 @@ the keyframe decides what step 2 draws.
 The haze in every grey-box run above is low contrast, not a colour cast. Over the structure frames
 (13-76) of the village, against the keyframe-only video:
 
-| Structure frames                     | Luminance 2nd-98th percentile | Range | Saturation | Detail (Laplacian) |
-| ------------------------------------ | ----------------------------: | ----: | ---------: | -----------------: |
-| keyframe only (no structure)         |                   0.17 - 0.97 |  0.80 |       0.23 |              0.043 |
-| grey box, latent recolouring (before) |                  0.35 - 0.76 |  0.41 |       0.14 |              0.026 |
-| grey box, `match_tone` (now)         |                   0.33 - 0.94 |  0.60 |       0.12 |              0.019 |
-| **`--project`, step 2**              |               **0.22 - 0.96** | **0.74** |   **0.18** |          **0.030** |
-| `--project`, step 3                  |                   0.24 - 0.97 |  0.72 |       0.17 |              0.027 |
+| Structure frames                      | Luminance 2nd-98th percentile |    Range | Saturation | Detail (Laplacian) |
+| ------------------------------------- | ----------------------------: | -------: | ---------: | -----------------: |
+| keyframe only (no structure)          |                   0.17 - 0.97 |     0.80 |       0.23 |              0.043 |
+| grey box, latent recolouring (before) |                   0.35 - 0.76 |     0.41 |       0.14 |              0.026 |
+| grey box, `match_tone` (now)          |                   0.33 - 0.94 |     0.60 |       0.12 |              0.019 |
+| **`--project`, step 2**               |               **0.22 - 0.96** | **0.74** |   **0.18** |          **0.030** |
+| `--project`, step 3                   |                   0.24 - 0.97 |     0.72 |       0.17 |              0.027 |
 
 The cause was the target, not the denoiser. Decoded back to pixels, the recoloured structure
 latents had a range of 0.51 (the keyframe's latent decodes to 0.75, the raw grey box to 0.58):
