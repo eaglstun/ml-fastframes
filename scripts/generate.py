@@ -26,13 +26,14 @@ from fastframes.pipeline import MODELS, FastFrames, configure_backends  # noqa: 
 from fastframes.video import save_video  # noqa: E402
 
 
-def load_model(name, checkpoint_dir):
+def load_model(name, checkpoint_dir, dit_bits=16):
     """Build a released model from ``<checkpoint_dir>`` (see docs/installation.md#checkpoints)."""
     spec = MODELS[name]
     root = Path(checkpoint_dir)
     configure_backends(spec.config)
     return FastFrames.from_pretrained(
-        spec.config, root / spec.wan_dir, root / spec.dit, root / spec.refiner, root / spec.decoder)
+        spec.config, root / spec.wan_dir, root / spec.dit, root / spec.refiner, root / spec.decoder,
+        dit_bits=dit_bits)
 
 
 def main():
@@ -51,6 +52,8 @@ def main():
                         help="video frames, 1 + 4k up to 81; fewer stop the rollout early with a smaller KV cache")
     parser.add_argument("--kv-bits", type=int, choices=(8, 16), default=16,
                         help="KV cache precision; 8 halves its memory (FastFrames-L at 81 frames on a 64 GB Mac)")
+    parser.add_argument("--dit-bits", type=int, choices=(8, 16), default=16,
+                        help="DiT block weight precision; 8 stores them as int8 (about half the DiT memory)")
     args = parser.parse_args()
     if args.frames % 4 != 1 or not 1 <= args.frames <= 81:
         parser.error("--frames must be 1 + 4k, at most 81")
@@ -64,7 +67,7 @@ def main():
         jobs = [(p, args.seed + i, out / f"{i:04d}.mp4") for i, p in enumerate(prompts)][args.shard::args.num_shards]
 
     limit_mps_memory()
-    model = load_model(args.model, args.checkpoint_dir)
+    model = load_model(args.model, args.checkpoint_dir, args.dit_bits)
     embeds = {}
     if model.device.type == "mps":
         # Unified memory is shared: encode every prompt up front, then drop the 11 GB umT5 encoder

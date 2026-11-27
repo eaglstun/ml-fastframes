@@ -40,7 +40,8 @@ than fp16 on M4. Interactive latency isn't reachable on this hardware; batch T2V
 ## FastFrames-L (14B)
 
 FastFrames-L runs on a 64 GB Mac: all 81 frames with an 8-bit KV cache (`--kv-bits 8`), or clips
-of up to 41 frames at full bf16 precision. It needs the `fastframes-l/` weights (30.7 GB) and
+of up to 41 frames at full bf16 precision. `--dit-bits 8` also stores the DiT's attention and FFN
+weights as int8, halving them (26.6 -> 13.5 GiB) at the same speed. It needs the `fastframes-l/` weights (30.7 GB) and
 Wan2.1-14B's umT5 encoder and tokenizer, which are the same files the LingBot 14B folder holds, so
 a link saves the 69 GB Wan snapshot:
 
@@ -54,13 +55,17 @@ ln -s ../../lingbot-world-v2-14b-causal-fast/google/umt5-xxl checkpoints/Wan2.1-
 FASTFRAMES_MPS_MEMORY_FRACTION=0.95 .venv/bin/python scripts/generate.py --model ff-l \
     --prompt "A corgi surfing a wave at sunset" --seed 0 --kv-bits 8 --output outputs/corgi_l.mp4
 # or 41 frames at full precision: --frames 41 instead of --kv-bits 8
+# add --dit-bits 8 for int8 DiT weights: 3-5 GB more headroom at the same speed
 ```
 
-| M4 Max, 64 GB            | FastFrames-S, 81 | FastFrames-L, 41, bf16 KV | FastFrames-L, 81, int8 KV |
-| ------------------------ | ---------------: | ------------------------: | ------------------------: |
-| rollout + decode         |             40 s |                     139 s |     332 s (~15.8 s/frame) |
-| end to end, with load    |                - |                     174 s |                     384 s |
-| memory left at the low point | ~13 GB       |                    7.5 GB |                    6.7 GB |
+| M4 Max, 64 GB            | FastFrames-S, 81 | FastFrames-L, 41, bf16 KV | FastFrames-L, 81, int8 KV | FastFrames-L, 41, int8 DiT | FastFrames-L, 81, int8 DiT + KV |
+| ------------------------ | ---------------: | ------------------------: | ------------------------: | -------------------------: | ------------------------------: |
+| rollout + decode         |             40 s |                     139 s |     332 s (~15.8 s/frame) |                      126 s |                           310 s |
+| end to end, with load    |                - |                     174 s |                     384 s |                          - |                               - |
+| memory left at the low point | ~13 GB       |                    7.5 GB |                    6.7 GB |                    13.0 GB |                         11.4 GB |
+
+Run to run, these times vary by about 10%: the 81-frame int8-KV run took 325 s on the day of the
+int8 DiT runs, with 8.0 GB left.
 
 At the same prompt and seed, FastFrames-L draws a recognisable corgi where FastFrames-S draws a dark
 silhouette on a board.
@@ -70,12 +75,12 @@ byte-identical to before):
 
 | Part                                     |    Size | Change                                                                 |
 | ---------------------------------------- | ------: | ---------------------------------------------------------------------- |
-| DiT weights, bf16                        | 28.6 GB | `.safetensors` load straight to MPS: loading to CPU and moving held 57 GB |
+| DiT weights, bf16                        | 28.6 GB | `.safetensors` load straight to MPS: loading to CPU and moving held 57 GB; `--dit-bits 8`: 13.5 GiB, quantized as the file streams in |
 | KV cache, 40 layers x 1,560 tokens/frame | 1.3 GB/frame | `--frames` sizes it to the clip; `--kv-bits 8` halves it: 13.8 GB at 81 frames instead of 26.8 GB |
 | KV refiner scratch, all 40 layers at once | ~5 GB  | with `--kv-bits 8`, 10 layers at a time                                |
 | FastOps fused QKV (FF-L's `fast_ops`)    |  6.3 GB | skipped off CUDA (a second copy of q/k/v, and slower on MPS)           |
 | umT5 encoder                             |   11 GB | dropped after encoding; moving it to CPU still held it in unified memory |
-| KV refiner + pixel decoder               |  2.1 GB | -                                                                      |
+| KV refiner + pixel decoder               |  2.1 GB | the refiner is built on `meta` and takes the loaded tensors, so it isn't held twice while loading |
 
 `--frames` (1 + 4k, up to 81) stops the rollout early. The noise is still drawn for 81 frames, so
 a short clip is exactly the start of the full one (checked with FastFrames-S: the 41-frame video
@@ -100,6 +105,36 @@ What the int8 cache does to the frames, against the BF16 cache at the same seed:
 FastFrames-S drifts more over its 21 autoregressive frames, and the low PSNR measures that drift, not
 worse frames: judge those runs by looking. The 81-frame FastFrames-L run's first 41 frames are
 38.8 dB from the BF16 41-frame clip.
+
+### int8 DiT weights (`--dit-bits 8`)
+
+`--dit-bits 8` stores the q/k/v/o projections of both attentions and the two FFN layers of every
+block as int8 with one bf16 scale per output row (absmax over the inputs): 98% of the DiT's
+weights. Embeddings, time projections, modulation and the head stay bf16. The checkpoint is
+quantized tensor by tensor as it streams from the `.safetensors` file
+(`fastframes/wan/int8.py`), so the bf16 DiT is never resident: loading bf16 and quantizing
+afterwards needs 29 GiB at the start, more than the default 60% cap. Each layer converts its int8
+weight to bf16 for the GEMM and scales the output rows. That is about 6% slower per layer in
+isolation and costs nothing measurable end to end.
+
+`torch._weight_int8pack_mm` would multiply int8 weights directly and is as fast as bf16, but on
+MPS (torch 2.9.1) about 1 call in 50 returns a corrupted 16x8 output tile (errors of up to ~20% of
+the typical value), so runs neither repeat nor match. It isn't used; a test checks that 50
+repeated calls are bit-identical.
+
+What int8 weights do to the frames, against bf16 weights at the same seed (per-frame PSNR):
+
+| Run                                 | mean, first, last frame | What you see                                                       |
+| ----------------------------------- | ----------------------: | ------------------------------------------------------------------ |
+| FastFrames-L, 41 frames             |    22.9, 26.5, 20.8 dB | same corgi, pose and framing; wave and sun details differ          |
+| FastFrames-L, 81 frames, int8 KV both |  22.1, 26.5, 22.4 dB | same as above, all the way to frame 80                             |
+| FastFrames-S, 81 frames             |    22.9, 28.0, 23.2 dB | same scene and quality, the motion diverges as with the int8 cache |
+
+Unlike the int8 cache, int8 weights change every frame from the first, so PSNR is lower even where
+the videos look equivalent. Runs repeat byte for byte. The memory saving doesn't remove
+`FASTFRAMES_MPS_MEMORY_FRACTION=0.95` for FastFrames-L: the KV cache alone (13.8 GB at 81 frames with
+`--kv-bits 8`) plus the int8 DiT still needs more than the default cap. Without the flag, output is
+byte-identical to before.
 
 ## Metal flash-attention kernel
 

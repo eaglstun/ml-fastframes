@@ -77,8 +77,8 @@ model was trained at 832x464. Setup, measurements and the changes are in
 [MAC.md](MAC.md#lingbot-camera-control-interactive-demo).
 
 FastFrames-L (14B) runs too: all 81 frames with an 8-bit KV cache (`--kv-bits 8`) in ~6.4 min on
-the M4 Max, or clips of up to 41 frames at full precision (`--frames 41`, ~3 min). FastFrames-S
-takes 40 s. Setup and numbers are in [MAC.md](MAC.md#fastframes-l-14b).
+the M4 Max, or clips of up to 41 frames at full precision (`--frames 41`, ~3 min). `--dit-bits 8`
+halves the DiT weights (26.6 -> 13.5 GiB) at the same speed. FastFrames-S takes 40 s. Setup and numbers are in [MAC.md](MAC.md#fastframes-l-14b).
 
 The single-device [latency benchmarks](MAC.md#latency-benchmarks) run too: one FastFrames-S step
 (4 frames) takes ~3.2 s on the M4 Max (35.4 ms on a B200), and one LingBot chunk ~26 s.
@@ -155,8 +155,9 @@ and FFN kernels near peak, the glue between them ~12%). What's left, roughly by 
       (as `--structure` already does). Cuts DiT time a lot, but quality has to be measured.
 - [ ] **A faster attention kernel.** Attention is ~60% of a DiT block. Beating the current Metal
       flash kernel is real work and may not pay off.
-- [ ] **8-bit DiT weights.** The next big memory cut after the ~27 GB peak. Frames are no
-      longer bit-identical, so it's a quality trade-off.
+- [ ] **8-bit DiT weights.** Done for FastFrames-S and -L (`--dit-bits 8`,
+      [MAC.md](MAC.md#int8-dit-weights---dit-bits-8)). Still to do for LingBot, whose DiT feeds
+      fused bf16 weights to `F.linear` and to the iPad split.
 - [ ] **iPad split: `--kv-bits 8`.** Halves the K/V on the USB link; untested beyond A/B noise
       because the iPad's GPU throttles under sustained load, which caps the split at ~1.26x.
 - [ ] **Fuse the glue ops** (norms, modulation, residuals) in a DiT block: at most a few percent.
