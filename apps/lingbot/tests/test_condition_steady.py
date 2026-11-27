@@ -88,6 +88,20 @@ class ConditionShortcutTests(unittest.TestCase):
             self.assertTrue(torch.equal(a, b))
         self.assertTrue(condition.steady)  # reached only after the state itself settled
 
+    def test_reuse_after_repeats_the_last_encoded_latent(self):
+        exact, _ = self.encode(FakeEncoderModel(settle=10), 4)
+        model = FakeEncoderModel(settle=10)
+        condition = conditioning.LazyImageCondition(FakeVAE(model), self.image, 240, "cpu",
+                                                    reuse_after=conditioning.CHUNK)
+        reused = [condition.chunk(c) for c in range(4)]
+        self.assertEqual(model.calls, conditioning.CHUNK)  # only the first chunk was encoded
+        self.assertTrue(torch.equal(reused[0], exact[0]))
+        last = exact[0][4:, -1:]  # the first chunk's last latent, after the 4 mask channels
+        for c in range(1, 4):
+            self.assertTrue(torch.equal(reused[c][4:], last.expand_as(reused[c][4:])))
+            self.assertFalse(torch.equal(reused[c], exact[c]))  # an approximation, unlike the fixed point
+        self.assertIsNone(model._enc_feat_map[0])  # feature cache freed once encoding stopped
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -497,6 +497,8 @@ def main():
                         help="the iPad's starting fraction of each pass's tokens (rebalanced every chunk)")
     parser.add_argument("--ipad-all-sizes", action="store_true",
                         help="share smaller frame sizes too (by default only 832x464, where it pays off)")
+    parser.add_argument("--exact-condition", action="store_true", default=None,
+                        help="off CUDA: VAE-encode every chunk's image condition as upstream does (slower)")
     parser.add_argument("--steps", default="0,1,3", type=lambda v: tuple(int(i) for i in v.split(",")),
                         help="denoising steps per chunk, indices into the 4-step schedule from 0 to 3 "
                         "(default 0,1,3: three DiT passes; 0,1,2,3 runs all four, as trained)")

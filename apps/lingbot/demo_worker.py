@@ -120,7 +120,8 @@ def _worker(rank, config, commands, replies, rendezvous):
                 else:
                     with Image.open(io.BytesIO(request["image"])) as image:
                         pipe.start(image.convert("RGB"), request["prompt"], seed=request["seed"],
-                                   latents=LATENTS, noise="chunk")
+                                   latents=LATENTS, noise="chunk",
+                                   exact_condition=config.get("exact_condition"))
                 if fingerprint is None and cuda:
                     # Eager off CUDA: nothing to compile or capture, so no warm-up chunks.
                     # Visit every cache length and both cold/steady decoder shapes twice.
@@ -186,7 +187,8 @@ def _worker(rank, config, commands, replies, rendezvous):
             replies.put({"rank": rank, "result": result, "memory": memory})
             if prefetch and op in ("start", "step"):
                 # Neither the cache write (KV refinement, ~0.6 s on MPS) nor the next chunk's VAE
-                # condition (~4 s) depends on the next action: run them while the player decides.
+                # condition (~4 s; only the first chunk's unless --exact-condition) depends on the next
+                # action: run them while the player decides.
                 pipe.finish_chunk()
                 pipe.prefetch_condition()
             if cuda:
