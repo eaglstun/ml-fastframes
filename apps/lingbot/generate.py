@@ -130,6 +130,9 @@ def main():
                         "frame, SDEdit style; frame 0 is the first image's view")
     parser.add_argument("--structure-step", type=int, default=2,
                         help="denoising step the structure starts at, 1-3: higher follows it more closely, rougher")
+    parser.add_argument("--steps", default="0,1,3", type=lambda v: tuple(int(i) for i in v.split(",")),
+                        help="denoising steps to run, indices into the 4-step schedule from 0 to 3 "
+                        "(default 0,1,3: three DiT passes per chunk; 0,1,2,3 runs all four, as trained)")
     parser.add_argument("--frames", type=int, help="RGB frames to generate (rounded down to whole chunks)")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--output", type=Path, required=True)
@@ -149,7 +152,8 @@ def main():
                                      pipe.device, first_image=image)
     pipe.start(image, prompt, seed=seed, latents=CHUNK * chunks)
     frames = [pipe.step(rays(chunk), structure=None if structure is None else
-                        structure[:, CHUNK * chunk:CHUNK * (chunk + 1)], structure_step=args.structure_step)
+                        structure[:, CHUNK * chunk:CHUNK * (chunk + 1)], structure_step=args.structure_step,
+                        steps=args.steps)
               for chunk in range(chunks)]
     synchronize(pipe.device)
     if rank == 0:

@@ -151,13 +151,17 @@ The cheap wins are taken (LingBot peaks at ~27 GB; a chunk's DiT is ~80% of its 
 and FFN kernels near peak, the glue between them ~12%). What's left, roughly by expected payoff:
 
 - [x] **FastFrames-L at 81 frames.** Done with an int8 KV cache (`--kv-bits 8`).
-- [ ] **Fewer denoising steps.** Start LingBot chunks at step 2 or 3 of the 4-step schedule
-      (as `--structure` already does). Cuts DiT time a lot, but quality has to be measured.
+- [x] **Fewer denoising steps.** LingBot now skips one of its four DiT passes per chunk by default
+      (`--steps 0,1,3`): ~12% faster at the same sharpness, 25% faster demo turns at 576x320;
+      `--steps 0,1,2,3` runs all four. `0,3` is 32% faster but hazy
+      ([MAC.md](MAC.md#fewer-denoising-steps---steps)). The last step has to stay: the decoder and
+      refiner were trained on its features.
 - [ ] **A faster attention kernel.** Attention is ~60% of a DiT block. Beating the current Metal
       flash kernel is real work and may not pay off.
-- [ ] **8-bit DiT weights.** Done for FastFrames-S and -L (`--dit-bits 8`,
-      [MAC.md](MAC.md#int8-dit-weights---dit-bits-8)). Still to do for LingBot, whose DiT feeds
-      fused bf16 weights to `F.linear` and to the iPad split.
+- [x] **8-bit DiT weights.** Done for FastFrames-S and -L (`--dit-bits 8`,
+      [MAC.md](MAC.md#int8-dit-weights---dit-bits-8)). Not worth it for LingBot: its DiT is 1.7B
+      parameters (3.2 GiB in bf16), so int8 would save ~1.3 GiB of the ~27 GB peak and change
+      every frame. The KV cache, VAE and activations are what fill that peak.
 - [ ] **iPad split: `--kv-bits 8`.** Halves the K/V on the USB link; untested beyond A/B noise
       because the iPad's GPU throttles under sustained load, which caps the split at ~1.26x.
 - [ ] **Fuse the glue ops** (norms, modulation, residuals) in a DiT block: at most a few percent.
