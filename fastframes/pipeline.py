@@ -20,11 +20,12 @@ from typing import Optional, Sequence
 
 import torch
 
-from .device import default_device
-from .checkpoints import build_wan, load_state_dict
+from .device import default_device, release_mps_cache
+from .checkpoints import transform_state, build_wan, load_state_dict
 from .models.kv_refinement import KVRefinementNetwork
 from .models.pixel_decoder import BridgedPixelDecoder, PixelDecoder, align_frames
 from .wan.causal_model import FastOps, QuantizedKV, allocate_kv_cache, kv_read, kv_write
+from .wan.int8 import Int8Linear, quantize_state
 from .wan.model import WAN_CONFIGS
 from .wan.scheduler import FlowMatchScheduler
 from .wan.text_encoder import TextEncoder
@@ -124,28 +125,46 @@ class FastFrames:
         self.frame_tokens = height * width // 4
         # Off CUDA, skip FastOps: its fused QKV weights are a second copy of q/k/v (6.3 GB for the
         # 14B DiT) and measured slower on MPS than the separate GEMMs.
-        use_fast = config.fast_ops and self.device.type == "cuda"
+        # FastOps concatenates bf16 q/k/v weights, so it is off for an int8 DiT too.
+        quantized = isinstance(dit.blocks[0].self_attn.q, Int8Linear)
+        use_fast = config.fast_ops and self.device.type == "cuda" and not quantized
         self.fast = FastOps(dit, height, width, config.num_frames) if use_fast else None
         self._time = {}
         self._refine_embedding = None
 
     @classmethod
-    def from_pretrained(cls, config, wan_dir, dit, refiner, decoder, *, device=None):
-        """Build from checkpoint paths (or already-loaded state dicts)."""
+    def from_pretrained(cls, config, wan_dir, dit, refiner, decoder, *, device=None, dit_bits=16):
+        """Build from checkpoint paths (or already-loaded state dicts).
+
+        ``dit_bits=8`` stores the DiT blocks' attention and FFN weights as int8 with per-row scales
+        (:func:`~fastframes.wan.int8.quantize_blocks`): about half the DiT memory.
+        """
         device = device or default_device()
         # On MPS, load .safetensors straight to the device (one copy instead of CPU + device).
         load_device = device if torch.device(device).type == "mps" else "cpu"
 
-        def state(value, key=None):
-            return value if isinstance(value, dict) else load_state_dict(value, key, device=load_device)
+        def state(value, key=None, transform=None):
+            if isinstance(value, dict):
+                return transform_state(value.items(), transform)
+            return load_state_dict(value, key, device=load_device, transform=transform)
 
-        dit = build_wan(config.wan_model, state(dit, "generator_ema"), device=device)
+        if dit_bits not in (8, 16):
+            raise ValueError("dit_bits must be 8 or 16")
+        int8 = dit_bits == 8
+        dit = build_wan(config.wan_model, state(dit, "generator_ema", quantize_state if int8 else None),
+                        device=device, int8=int8)
+        if int8:
+            release_mps_cache(device)  # the quantizer's float temporaries
         wan = WAN_CONFIGS[config.wan_model]
         refiner_state = state(refiner, "adapter")
-        refiner_net = KVRefinementNetwork(
-            dim=wan.dim, num_heads=wan.num_heads, head_dim=wan.dim // wan.num_heads,
-            num_blocks=wan.num_layers, d_a=refiner_state["stem_in.weight"].shape[0]).to(torch.bfloat16)
-        refiner_net.load_state_dict(refiner_state, strict=True)
+        # Built on meta and given the loaded tensors (assign), so the 1.8 GB FastFrames-L refiner
+        # is never held twice.
+        with torch.device("meta"):
+            refiner_net = KVRefinementNetwork(
+                dim=wan.dim, num_heads=wan.num_heads, head_dim=wan.dim // wan.num_heads,
+                num_blocks=wan.num_layers, d_a=refiner_state["stem_in.weight"].shape[0])
+        refiner_net.load_state_dict(refiner_state, strict=True, assign=True)
+        refiner_net = refiner_net.to(torch.bfloat16)
         decoder_state = state(decoder)
         if any(k.startswith("bridge.") for k in decoder_state):
             decoder_net = BridgedPixelDecoder(in_dim=wan.dim)
