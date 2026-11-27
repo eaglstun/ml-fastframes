@@ -308,9 +308,12 @@ grey-box video is VAE-encoded one latent at a time, and each chunk starts from i
 to denoising step `--structure-step` (default 2) instead of from pure noise. The steps before that
 are skipped.
 
-The structure latents are recoloured to the first image first: their per-channel mean and std
-are matched to its latent. Without that, a flat grey render survives the noise as its colour and
-brightness, and every frame comes out as grey fog, even at step 1 (6% structure).
+The structure frames take the first image's tone first: each frame's RGB mean and std are matched
+to its pixels before encoding (`match_tone`). Without that, a flat grey render survives the noise
+as its colour and brightness, and every frame comes out as grey fog, even at step 1 (6% structure).
+The table below was measured with the earlier version, which matched the encoded latents' per-channel
+statistics instead; that flattened the contrast (see
+[Projecting the keyframe](#projecting-the-keyframe---project)).
 
 The structure frames are rendered shadowless by default (`--structure-lighting studio`:
 Workbench, studio light, one grey, no shadows), so surfaces read by their orientation alone. With
@@ -332,10 +335,10 @@ Same street and seed, from the same keyframe:
 | `--structure-step 3`       | studio           | 1     | 65 s with encode    | clean painted grey box: boxes stay boxes, no shadow walls; no photographic detail      |
 | step 2 without recolouring | scene            | 2     | 58 s                | grey fog                                                                               |
 
-Step 2 with studio light and the sky fill is the default and the best balance. Step 3 is a
-painted look: one step can paint the layout but not rebuild it. Recolouring matches statistics over
-the whole frame, so with a fixed light grey-box sky (before the sky fill) the keyframe's black
-night sky came out hazy and bright. A more detailed
+Step 2 with studio light and the sky fill was the best balance of these. Step 3 is a painted look:
+one step can paint the layout but not rebuild it. Tone matching uses statistics over the whole
+frame, so with a fixed light grey-box sky (before the sky fill) the keyframe's black night sky came
+out hazy and bright. A more detailed
 grey box should help step 2 most, since less is left to invent. Without `--structure`, `step()`
 is unchanged: the video is frame-identical to before.
 
@@ -360,7 +363,7 @@ Same keyframe and seed, 77 frames:
 | Start                     | Video, end to end | Result                                                                                                                              |
 | ------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | pure noise (no structure) | 136 s             | sharpest and sunniest; keeps the keyframe's planters; the walk and the late pan left come through weakly                            |
-| `--structure-step 2`      | 114 s             | windows, balconies, awnings and lamps where the grey box puts them, blue sky; planters stay planters; washed out, low contrast      |
+| `--structure-step 2`      | 114 s             | windows, balconies, awnings and lamps where the grey box puts them, blue sky; planters stay planters; washed out (fixed below)       |
 | `--structure-step 3`      | 101 s             | traces the grey box exactly, cars with wheels; painted; the left facades come out dark grey because the studio light shades them so |
 
 The sky fill works in daylight: both structure runs have a blue sky. The extra detail helps step 2
@@ -368,6 +371,46 @@ with placement (every balcony and awning lands where it was modelled), not with 
 keyframe and the grey box disagree (planters against cars), step 2 keeps the keyframe and step 3
 takes the grey box. So model what matters for the keyframe too: a depth map can't show wheels, and
 the keyframe decides what step 2 draws.
+
+#### Projecting the keyframe (`--project`)
+
+The haze in every grey-box run above is low contrast, not a colour cast. Over the structure frames
+(13-76) of the village, against the keyframe-only video:
+
+| Structure frames                     | Luminance 2nd-98th percentile | Range | Saturation | Detail (Laplacian) |
+| ------------------------------------ | ----------------------------: | ----: | ---------: | -----------------: |
+| keyframe only (no structure)         |                   0.17 - 0.97 |  0.80 |       0.23 |              0.043 |
+| grey box, latent recolouring (before) |                  0.35 - 0.76 |  0.41 |       0.14 |              0.026 |
+| grey box, `match_tone` (now)         |                   0.33 - 0.94 |  0.60 |       0.12 |              0.019 |
+| **`--project`, step 2**              |               **0.22 - 0.96** | **0.74** |   **0.18** |          **0.030** |
+| `--project`, step 3                  |                   0.24 - 0.97 |  0.72 |       0.17 |              0.027 |
+
+The cause was the target, not the denoiser. Decoded back to pixels, the recoloured structure
+latents had a range of 0.51 (the keyframe's latent decodes to 0.75, the raw grey box to 0.58):
+matching each latent channel's mean and std doesn't keep pixel contrast. Re-matching the latents
+between denoising steps changed nothing (0.41); scaling the structure up by 2 recovered the range
+(0.63) by force. Matching in pixels before encoding (`match_tone`) gives the target 0.72, and the
+whites come back, but a full-contrast grey box is a stronger signal, and step 2 then copies it: grey
+facades, box cars with wheels.
+
+So give the structure frames the keyframe's look instead of grey. `blender_stage.py --project
+keyframe.png` renders them with the keyframe projected onto the scene from the start camera (a
+material override: each shaded point is mapped through the start camera's intrinsics, per pixel;
+Cycles emission, 37 s for 81 frames). The keyframe was made from frame 0's depth, so its pixels sit
+on the right geometry, and later frames show its walls, balconies and pavement where they moved to.
+Surfaces outside the start view render grey; surfaces hidden behind others in frame 0 get the
+occluder's colours (no occlusion test), and near ground smears as the camera passes over it. Step 2
+repaints those, and the result is the sharpest structure run: sunny, saturated, following the grey
+box's layout and the walk. Step 3 keeps the smears.
+
+```bash
+# after the keyframe: export again with the keyframe projected (structure/ only changes)
+/Applications/Blender.app/Contents/MacOS/Blender -b village.blend --python apps/lingbot/blender_stage.py -- \
+    --out outputs/village --project keyframe.png --prompt "A sunny Mediterranean village street ..."
+.venv/bin/python apps/lingbot/generate.py --model lingbot-1.3b --lingbot-root upstream/lingbot-world-v2 \
+    --condition outputs/village/condition.json --image keyframe.png \
+    --structure outputs/village/structure --output outputs/village.mp4
+```
 
 ## Latency benchmarks
 

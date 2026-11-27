@@ -34,7 +34,7 @@ from fastframes.models.kv_refinement import KVRefinementNetwork
 from fastframes.models.pixel_decoder import PixelDecoder
 from fastframes.pipeline import to_uint8
 
-from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH, LazyImageCondition, recolor, text_context
+from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH, LazyImageCondition, text_context
 from .decoder import CapturedDecoder, SpatialDecoder
 from .dit import CACHE_FRAMES, FRAME_TOKENS, LingBotDiT, rope_frequencies, rope_table
 from .refiner import KVRefiner
@@ -245,7 +245,7 @@ class FastFramesLingBot:
         final frames are unchanged.
 
         ``structure`` (``[16, 4, 58, 104]``, this chunk's slice of ``encode_structure``) steers
-        every frame, SDEdit style: recoloured to the first image (``recolor``), noised to
+        every frame, SDEdit style: already matched to the first image's tone, noised to
         denoising step ``structure_step`` (1-3) and denoised from there, skipping the earlier
         steps. Higher steps follow the structure more closely and look rougher; 2 is the balance.
         """
@@ -268,7 +268,7 @@ class FastFramesLingBot:
         if structure is not None:
             if not 1 <= structure_step < len(self.timesteps):
                 raise ValueError(f"structure_step must be in [1, {len(self.timesteps) - 1}]")
-            target = recolor(structure.to(self.device, torch.float32), self.condition.encoded[0])
+            target = structure.to(self.device, torch.float32, copy=True)  # tone-matched by encode_structure
             if chunk == 0:  # latent 0 is the first image itself
                 target[:, 0] = self.condition.encoded[0][:, 0]
             x = self.scheduler.add_noise(target, x, self.schedule[structure_step])

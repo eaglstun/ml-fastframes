@@ -21,7 +21,9 @@ Writes to ``--out``:
 * ``structure/`` (with ``--structure``) -- every path frame, for ``generate.py --structure``,
   which steers each frame with them (SDEdit). Rendered shadowless by default (Workbench,
   studio light, one grey, transparent sky): cast-shadow edges come out of the generation as
-  painted walls, and a fixed sky colour skews the recolouring.
+  painted walls, and a fixed sky colour skews the tone matching. With ``--project IMAGE``
+  (the restyled first frame), the frames show that image projected onto the scene from the
+  start camera instead: the generation keeps its look rather than a grey box's.
 
 Without ``--structure`` only the start frame's look reaches LingBot; the camera path is
 followed for every frame either way.
@@ -57,7 +59,12 @@ def parse_args():
                         help="also render every path frame to structure/ (for generate.py --structure)")
     parser.add_argument("--structure-lighting", choices=("studio", "scene"), default="studio",
                         help="structure frames: shadowless Workbench studio light (default) or the scene's renderer")
-    return parser.parse_args(argv)
+    parser.add_argument("--project", type=Path,
+                        help="structure frames: this image (the restyled first frame) projected onto the scene "
+                        "from the start camera instead of grey (implies --structure)")
+    args = parser.parse_args(argv)
+    args.structure = args.structure or args.project is not None
+    return args
 
 
 def opencv_pose(camera):
@@ -111,6 +118,84 @@ def depth_material():
     links.new(camera.outputs["View Z Depth"], emission.inputs["Color"])
     links.new(emission.outputs["Emission"], output.inputs["Surface"])
     return material
+
+
+def projection_material(image_path, camera_matrix, lens):
+    """Every surface emits ``image`` as seen from a fixed camera (``camera_matrix``, ``lens`` =
+    ``(fx, fy, cx, cy)`` in pixels of a WIDTH x HEIGHT frame), projected per pixel; surfaces
+    outside that view, or behind it, emit flat grey. Hidden surfaces get whatever covers them in
+    the image (there is no occlusion test)."""
+    material = bpy.data.materials.new("lingbot_stage_projection")
+    material.use_nodes = True
+    nodes, links = material.node_tree.nodes, material.node_tree.links
+    nodes.clear()
+    # The shaded point in the projector's space (an empty at the start camera's pose; Blender
+    # camera axes: +x right, +y up, looking down -z), via a Texture Coordinate node's Object output.
+    projector = bpy.data.objects.new("lingbot_stage_projector", None)
+    projector.matrix_world = camera_matrix
+    bpy.context.scene.collection.objects.link(projector)
+    coords = nodes.new("ShaderNodeTexCoord")
+    coords.object = projector
+    xyz = nodes.new("ShaderNodeSeparateXYZ")
+    links.new(coords.outputs["Object"], xyz.inputs["Vector"])
+    fx, fy, cx, cy = lens
+
+    def op(operation, a, b):
+        node = nodes.new("ShaderNodeMath")
+        node.operation = operation
+        for index, value in enumerate((a, b)):
+            if isinstance(value, (int, float)):
+                node.inputs[index].default_value = value
+            else:
+                links.new(value, node.inputs[index])
+        return node.outputs[0]
+
+    depth = op("MULTIPLY", xyz.outputs["Z"], -1.0)  # distance in front of the projector
+    u = op("DIVIDE", op("ADD", op("MULTIPLY", op("DIVIDE", xyz.outputs["X"], depth), fx), cx), WIDTH)
+    v = op("DIVIDE", op("SUBTRACT", cy, op("MULTIPLY", op("DIVIDE", xyz.outputs["Y"], depth), fy)), HEIGHT)
+    uv = nodes.new("ShaderNodeCombineXYZ")
+    links.new(u, uv.inputs["X"])
+    links.new(op("SUBTRACT", 1.0, v), uv.inputs["Y"])  # image rows run top-down, texture v bottom-up
+    texture = nodes.new("ShaderNodeTexImage")
+    texture.image = bpy.data.images.load(str(image_path))
+    texture.extension = "CLIP"  # alpha 0 outside the image
+    links.new(uv.outputs["Vector"], texture.inputs["Vector"])
+    in_front = op("GREATER_THAN", depth, 0.0)
+    visible = op("MULTIPLY", texture.outputs["Alpha"], in_front)
+    mix = nodes.new("ShaderNodeMix")
+    mix.data_type = "RGBA"
+    # Mix has float, vector and colour sockets that share names: take the colour ones by type
+    a, b = [socket for socket in mix.inputs if socket.type == "RGBA"][:2]
+    a.default_value = (0.5, 0.5, 0.5, 1.0)
+    links.new(visible, mix.inputs[0])  # Factor
+    links.new(texture.outputs["Color"], b)
+    emission = nodes.new("ShaderNodeEmission")
+    links.new(next(socket for socket in mix.outputs if socket.type == "RGBA"), emission.inputs["Color"])
+    output = nodes.new("ShaderNodeOutputMaterial")
+    links.new(emission.outputs["Emission"], output.inputs["Surface"])
+    return material, projector
+
+
+@contextmanager
+def projected(scene, image_path, camera, start):
+    """Render with ``image_path`` projected from ``camera`` at frame ``start`` (Cycles emission,
+    transparent sky, colours passed through unchanged)."""
+    scene.frame_set(start)
+    material, projector = projection_material(image_path, camera.matrix_world.copy(), intrinsics(camera))
+    view_layer, settings, image = bpy.context.view_layer, scene.render, scene.render.image_settings
+    saved = (view_layer.material_override, settings.engine, scene.cycles.samples, settings.film_transparent,
+             scene.view_settings.view_transform, scene.view_settings.look, image.color_mode)
+    view_layer.material_override = material
+    settings.engine, scene.cycles.samples = "CYCLES", 8  # emission only: a few samples for antialiasing
+    settings.film_transparent = True
+    scene.view_settings.view_transform, scene.view_settings.look = "Standard", "None"
+    image.color_mode = "RGBA"
+    try:
+        yield
+    finally:
+        (view_layer.material_override, settings.engine, scene.cycles.samples, settings.film_transparent,
+         scene.view_settings.view_transform, scene.view_settings.look, image.color_mode) = saved
+        bpy.data.objects.remove(projector)
 
 
 def disparity_png(exr, png):
@@ -207,7 +292,9 @@ def main():
     settings.image_settings.color_mode = "RGB"
     render(scene, args.out / "staging.png")
     if args.structure:  # the path's frames at 16 fps
-        with studio_lighting(scene, args.structure_lighting == "studio"):
+        look = (projected(scene, args.project, camera, start) if args.project is not None
+                else studio_lighting(scene, args.structure_lighting == "studio"))
+        with look:
             fps = scene.render.fps / scene.render.fps_base
             for index in range(len(poses)):
                 frame = start + index * fps / FPS
