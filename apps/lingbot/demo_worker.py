@@ -79,6 +79,7 @@ def _worker(rank, config, commands, replies, rendezvous):
         # MPS/CPU: send a rough still of the chunk after the first two of its four denoising passes
         # (~30% and ~60% of the turn) while it finishes (LINGBOT_DEMO_PREVIEW=0 disables)
         previews = not cuda and world == 1 and os.environ.get("LINGBOT_DEMO_PREVIEW", "1") != "0"
+        steps = tuple(config.get("steps") or (0, 1, 3))  # denoising steps per chunk (--steps)
         while True:
             request = commands.get()  # No GPU collective is pending during user idle.
             op = request["op"]
@@ -143,11 +144,11 @@ def _worker(rank, config, commands, replies, rendezvous):
                     buffer = io.BytesIO()
                     Image.fromarray(frame).save(buffer, format="JPEG", quality=85)
                     replies.put({"rank": rank, "preview": {"jpeg": buffer.getvalue(), "pass": index + 1,
-                                                           "passes": len(pipe.timesteps),
+                                                           "passes": len(steps),
                                                            "chunk_index": pipe.chunk}})
 
                 frames = pipe.step(camera.rays(keys.chunk(action)), defer_cache=prefetch,
-                                   preview=send_preview if previews else None)
+                                   preview=send_preview if previews else None, steps=steps)
                 synchronize(device)
                 model_ms = (time.perf_counter() - start) * 1000
                 if world > 1:

@@ -295,6 +295,39 @@ What changed for LingBot:
 | `from_pretrained(device=None)` left the refiner/decoder on CPU                                                                                                                                                  | The device is resolved once at the top (`default_device()`)                                                                                                                     |
 | Demo memory stats call `torch.cuda`                                                                                                                                                                             | MPS reports `current_allocated_memory` / `driver_allocated_memory`                                                                                                              |
 
+### Fewer denoising steps (`--steps`)
+
+Each chunk is denoised in 4 DiT passes, at steps 0-3 of a fixed schedule. `generate.py` and
+`demo.py` take `--steps`, the steps to run; the default, `0,1,3`, runs three passes. Step 0 has to
+stay (the chunk starts from noise there), and so does step 3: its DiT features are what the pixel
+decoder and the KV refiner were trained on. A skipped step is jumped over: the x0 estimate is
+re-noised straight to the next step that runs. `--structure` still starts at its
+`--structure-step` and runs the listed steps after it. `--steps 0,1,2,3` runs all four, as
+trained, and its frames are byte-identical to the code before `--steps`.
+
+Examples 00 and 03, seed 0, 61 frames (4 chunks) at 832x464, M4 Max:
+
+| `--steps` | DiT passes | scene 00, 4 chunks | detail, range (scene 00) | detail, range (scene 03) | look                                                         |
+| --------- | ---------: | -----------------: | -----------------------: | -----------------------: | ------------------------------------------------------------ |
+| 0,1,2,3   |          4 |             74.4 s |              0.0245, 0.85 |             0.0257, 0.78 | the model as trained                                         |
+| 0,2,3     |          3 |             67.3 s |              0.0227, 0.81 |                        - | a little softer and hazier than 0,1,3                        |
+| **0,1,3** |      **3** |         **65.3 s** |          **0.0246, 0.82** |         **0.0265, 0.79** | as sharp as four steps; same scene and camera path           |
+| 0,3       |          2 |             50.5 s |              0.0227, 0.82 |             0.0230, 0.68 | soft and hazy: washed-out distance, milky water in scene 03  |
+
+Detail is the mean absolute Laplacian of luminance and range the 2nd-98th luminance percentile
+spread (as in [the haze measurements](#projecting-the-keyframe---project)), over frames 13-60. Each
+skipped pass saves ~3 s per full-size chunk; times are one run each and vary by ~10% run to run
+(the same 4-step run took 82.5 s from a clean `main` checkout). PSNR against four steps is ~20 dB
+for every variant: the videos take different paths through the same scene, which PSNR can't tell
+from quality. `0,1,3` is the free ~12%, hence the default; `0,3` buys 32% with the look.
+
+In the demo at 576x320 (`demo.py --profile-vram`, chunks 5-7, one run each), skipping step 2 cuts
+the time to a chunk's frames from 5.9 s to 4.5 s (25%), and the whole chunk with its cache write
+from 8.0 s to 6.6 s: at the smaller size the DiT passes are a larger share of the chunk.
+
+The demo's rough previews come after the first two passes run, so with the default three passes
+the page shows "preview 1 of 3" and "2 of 3".
+
 ### From a Blender grey box
 
 Block out a scene in Blender, animate its camera, and LingBot flies the same path through a photoreal

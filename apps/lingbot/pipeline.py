@@ -92,6 +92,18 @@ def load_decoder(path, config, device):
     return net.to(device, dtype=torch.bfloat16).eval().requires_grad_(False)
 
 
+def denoising_passes(steps, schedule_length, start=0):
+    """Schedule indices to denoise at: ``start`` (0, or a structure's step), then the ``steps`` after it.
+
+    ``steps`` must rise from 0 to the last step, whose features the decoder and refiner were trained on.
+    """
+    last = schedule_length - 1
+    steps = list(steps)
+    if not steps or steps != sorted(set(steps)) or steps[0] != 0 or steps[-1] != last:
+        raise ValueError(f"steps must be increasing schedule indices from 0 to {last}, got {steps}")
+    return [start] + [i for i in steps if i > start]
+
+
 class FastFramesLingBot:
     """One session at a time; under context parallelism every rank makes the same calls."""
 
@@ -228,7 +240,7 @@ class FastFramesLingBot:
 
     @torch.inference_mode()
     def step(self, rays, *, defer_cache=False, preview=None, preview_passes=(0, 1), structure=None,
-             structure_step=2):
+             structure_step=2, steps=(0, 1, 3)):
         """Generate the next chunk for camera ``rays`` (``Trajectory.rays`` / ``LiveCamera.rays``).
 
         Returns ``[16, 464, 832, 3]`` uint8 frames on rank 0 (13 for the first chunk: the pixel
@@ -240,7 +252,7 @@ class FastFramesLingBot:
         (the next ``step`` runs it first if the caller didn't). Same values either way.
 
         ``preview(index, frames)`` (rank 0, one GPU) receives the pixel decoding of the denoising
-        passes in ``preview_passes`` (0-based, before the last): rough frames of this chunk
+        passes in ``preview_passes`` (0-based numbers of the passes run, before the last): rough frames of this chunk
         available well before it's done. The decoder's history is restored afterwards, so the
         final frames are unchanged.
 
@@ -248,6 +260,11 @@ class FastFramesLingBot:
         every frame, SDEdit style: already matched to the first image's tone, noised to
         denoising step ``structure_step`` (1-3) and denoised from there, skipping the earlier
         steps. Higher steps follow the structure more closely and look rougher; 2 is the balance.
+
+        ``steps``: the denoising steps to run, as indices into the 4-step schedule. It must include
+        the last step (3), whose features the pixel decoder and KV refiner were trained on; leaving
+        out 1 or 2 skips that DiT pass (each is about a quarter of the chunk's DiT time). The default
+        skips step 2, which costs no visible sharpness; ``(0, 1, 2, 3)`` runs the model as trained.
         """
         if preview is not None and self.world != 1:
             raise ValueError("previews need a single device")
@@ -273,17 +290,19 @@ class FastFramesLingBot:
                 target[:, 0] = self.condition.encoded[0][:, 0]
             x = self.scheduler.add_noise(target, x, self.schedule[structure_step])
             first_step = structure_step
-        for i in range(first_step, len(self.timesteps)):
+        passes = denoising_passes(steps, len(self.timesteps), first_step)
+        for n, i in enumerate(passes):
             timestep = self.timesteps[i]
-            previewed = preview is not None and i in preview_passes and i + 1 < len(self.timesteps)
+            following = passes[n + 1] if n + 1 < len(passes) else None
+            previewed = preview is not None and n in preview_passes and following is not None
             result = self.dit(x, timestep, read_frames, capture=True if previewed else None)
             if previewed:
-                preview(i, self._preview_frames(result, chunk))
+                preview(n, self._preview_frames(result, chunk))
             x0 = (x.to(self.f64).double() - self.sigmas[i] * result.prediction.to(self.f64).double()).float()
             x0 = x0.to(self.device)
-            if i + 1 < len(self.timesteps):
+            if following is not None:
                 noise = torch.randn(x0.shape, device=self.device, dtype=x0.dtype, generator=self.generator)
-                x = self.scheduler.add_noise(x0, noise, self.schedule[i + 1])
+                x = self.scheduler.add_noise(x0, noise, self.schedule[following])
         self._pending = (chunk, x0, y, rope, read_frames)
         if not defer_cache:
             self._write_cache()
