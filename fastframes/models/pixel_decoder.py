@@ -22,6 +22,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from ..wan.model import WanLayerNorm
+from .mps_dwconv3d import try_causal_dwconv3d
 
 __all__ = ["PixelDecoder", "BridgedPixelDecoder", "align_frames"]
 
@@ -53,6 +54,9 @@ class _CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
 
     def forward(self, x):
+        out = try_causal_dwconv3d(x, self.weight, self.bias, self.stride, self.dilation, self.groups, self._pad)
+        if out is not None:
+            return out
         return super().forward(F.pad(x, self._pad))
 
 

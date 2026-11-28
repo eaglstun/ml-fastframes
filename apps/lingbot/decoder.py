@@ -23,6 +23,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from fastframes.device import synchronize
+from fastframes.models.mps_dwconv3d import try_causal_dwconv3d
 
 from .conditioning import CHUNK
 from .dit import GRID_H, GRID_W
@@ -68,11 +69,18 @@ class StreamingDecoder(torch.nn.Module):
         current = value.reshape(1, CHUNK, self.rows, self.width, self.dim).permute(0, 4, 1, 2, 3).contiguous()
         current = head.entry_pw(head.entry_norm(current))
         for block, history in zip(self.blocks, self.history):
-            inputs = torch.cat((history, current), dim=2)
-            hidden = F.conv3d(F.pad(inputs, (1, 1, 1, 1, 0, 0)), block.dw.weight, block.dw.bias,
-                              stride=block.dw.stride, dilation=block.dw.dilation, groups=block.dw.groups)
+            hidden = try_causal_dwconv3d(current, block.dw.weight, block.dw.bias, block.dw.stride,
+                                         block.dw.dilation, block.dw.groups, (1, 1, 1, 1, 2, 0), history=history)
+            if hidden is None:
+                inputs = torch.cat((history, current), dim=2)
+                hidden = F.conv3d(F.pad(inputs, (1, 1, 1, 1, 0, 0)), block.dw.weight, block.dw.bias,
+                                  stride=block.dw.stride, dilation=block.dw.dilation, groups=block.dw.groups)
+                history.copy_(inputs[:, :, -2:])
+            elif current.shape[2] >= 2:
+                history.copy_(current[:, :, -2:])
+            else:
+                history.copy_(torch.cat((history[:, :, current.shape[2]:], current), dim=2))
             hidden = block.pw2(block.act(block.pw1(block.norm(hidden))))
-            history.copy_(inputs[:, :, -2:])
             current = current + hidden
         tokens = current.permute(0, 2, 3, 4, 1).contiguous().view(1, CHUNK, self.rows * self.width, self.dim)
         pixels = head.fc_out(tokens).reshape(1, CHUNK, self.rows, self.width, 4, 16, 16, 3)

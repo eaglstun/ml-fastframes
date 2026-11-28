@@ -554,6 +554,37 @@ For comparison, the Wan VAE decode that the baselines use instead of the pixel d
 1.5 s per latent frame here with the conv2d path below (4.9 s with PyTorch's MPS `conv3d`; two
 streamed passes each, back to back), ~26x the pixel decoder.
 
+### Causal depthwise 3D convolution for `PixelDecoder` on MPS
+
+`PixelDecoder` (`fastframes/models/pixel_decoder.py`), `StreamingDecoder` (`apps/lingbot/decoder.py`),
+and `StreamingPixelDecoder` (`evaluation/latency/decoders.py`) each evaluate three causal 3×3×3
+depthwise convolutions (`groups=1536`). Native MPS grouped `conv3d` accounted for ~60–65% of the
+decoder's runtime (~13 GFLOPS). `fastframes/models/mps_dwconv3d.py` evaluates those depthwise
+layers in one Metal dispatch with FP32 accumulation and no `F.pad` or `torch.cat((history, current))`
+allocations (`FASTFRAMES_MPS_DECODER_CONV=native` or `FASTFRAMES_MPS_CONV3D=native` restores
+`F.conv3d`). Streaming and clip-level `PixelDecoder` remain bitwise equal (`max_abs_diff = 0.0`).
+
+Measured on the M4 Max 64 GB (`779e25c` baseline, alternating warm samples):
+
+| Decoder workload | Native MPS `conv3d` | Metal depthwise | Speedup |
+| --- | ---: | ---: | ---: |
+| `profile_components.py pixel-decoder` (1 latent frame, 480p) | 46.54 ms | **19.36 ms** | 2.40× |
+| LingBot `StreamingDecoder`, 416×240 (1 chunk) | 49.17 ms | **19.10 ms** | 2.57× |
+| LingBot `StreamingDecoder`, 576×320 (1 chunk) | 80.66 ms | **33.54 ms** | 2.41× |
+| LingBot `StreamingDecoder`, 832×464 (1 chunk) | 171.11 ms | **66.14 ms** | 2.59× |
+| FastFrames-S real 81-frame `decode` | 1000.84 ms | **418.81 ms** | 2.39× |
+| FastFrames-L 81-frame `BridgedPixelDecoder` | 962.72 ms | **412.40 ms** | 2.33× |
+
+On real FastFrames-S rollout features (corgi prompt, seed 0), Metal's FP32-accumulated decode is
+slightly closer to a CPU FP32 reference than native MPS `conv3d` (mean PSNR **56.31 dB** vs
+56.11 dB; 57.90 dB between the two MPS paths, max uint8 diff 4). Because the pixel decoder sits
+outside the autoregressive loop, latents and KV caches are unchanged. In four warmed AB/BA 93-frame
+LingBot previewed rollouts (example 00, seed 0, two previews plus final decode per chunk), Metal
+won **all four pairs** at 416×240 (**5.19%** paired median reduction, 56.70 dB PSNR, max uint8 diff 3;
+[results](docs/benchmarks/decoder-conv-416x240.jsonl)) and **all four pairs** at 576×320 (**3.43%**
+paired median reduction, ~1.05 s/clip, 57.25 dB PSNR, max uint8 diff 3;
+[results](docs/benchmarks/decoder-conv-576x320.jsonl)).
+
 LingBot 1.3B, one chunk (16 frames, 1 s of video) with a full 18-frame cache: **25.9 s** median
 (16 chunks, range 25.3-26.4 s) against 220.7 ms on a B200. The run uses 16-chunk videos
 (`--frames 253`) and 16 samples instead of upstream's 60-chunk videos and 30 samples: a

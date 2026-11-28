@@ -34,6 +34,7 @@ from models import load_decoder
 from timing import capture_graph, compare, synchronize
 
 from fastframes.checkpoints import load_state_dict
+from fastframes.models.mps_dwconv3d import try_causal_dwconv3d
 from fastframes.models.pixel_decoder import BridgedPixelDecoder, align_frames
 
 __all__ = ["StreamingPixelDecoder", "profile_decoder", "profile_vae"]
@@ -82,12 +83,20 @@ class StreamingPixelDecoder(torch.nn.Module):
         x = x.reshape(1, 1, self.height, self.width, core.dim).permute(0, 4, 1, 2, 3).contiguous()
         x = self._conv(0, core.entry_pw, core.entry_norm(x), 0)
         for i, (block, history) in enumerate(zip(self.blocks, self.history)):
-            inputs = torch.cat((history, x), dim=2)
             pad = block.dw._pad
-            y = self._conv(1 + 3 * i, block.dw, F.pad(inputs, (pad[0], pad[1], pad[2], pad[3], 0, 0)), 0)
+            dw_idx = 1 + 3 * i
+            y = try_causal_dwconv3d(x, self.conv_w[dw_idx], self.conv_b[dw_idx],
+                                    block.dw.stride, block.dw.dilation, block.dw.groups, pad, history=history)
+            if y is None:
+                inputs = torch.cat((history, x), dim=2)
+                y = self._conv(dw_idx, block.dw, F.pad(inputs, (pad[0], pad[1], pad[2], pad[3], 0, 0)), 0)
+                history.copy_(inputs[:, :, -2:])
+            elif x.shape[2] >= 2:
+                history.copy_(x[:, :, -2:])
+            else:
+                history.copy_(torch.cat((history[:, :, x.shape[2]:], x), dim=2))
             y = self._conv(2 + 3 * i, block.pw1, block.norm(y), 0)
             y = self._conv(3 + 3 * i, block.pw2, block.act(y), 0)
-            history.copy_(inputs[:, :, -2:])
             x = x + y
         tokens = x.permute(0, 2, 3, 4, 1).contiguous().view(1, 1, self.tokens, core.dim)  # GEMM layout of the release
         out = F.linear(tokens, self.fc_w, self.fc_b)
