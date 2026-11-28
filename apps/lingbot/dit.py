@@ -37,6 +37,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from fastframes.device import synchronize
 from fastframes.wan.attention import attention as _ff_attention
+from fastframes.wan.mps_rmsnorm import try_rms_norm
 
 from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
 from .mps_rope import try_rope
@@ -96,6 +97,10 @@ def rope_real(value, table):
 
 
 def rms_norm(value, module):
+    if value.device.type == "mps":
+        normed = try_rms_norm(value, module.weight, module.eps)
+        if normed is not None:
+            return normed
     normed = value.float() * torch.rsqrt(value.float().square().mean(-1, keepdim=True) + module.eps)
     return normed.to(value.dtype) * module.weight
 
