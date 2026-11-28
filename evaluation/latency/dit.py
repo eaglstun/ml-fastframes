@@ -35,7 +35,7 @@ from timing import capture_graph, synchronize  # also puts the repository root o
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from fastframes.wan.attention import attention
-from fastframes.wan.causal_model import CausalWanModel, allocate_kv_cache
+from fastframes.wan.causal_model import CausalWanModel, allocate_kv_cache, rope_real as _rope
 from fastframes.wan.model import causal_rope_apply
 
 __all__ = ["Geometry", "RESOLUTIONS", "FrameDiT", "split_kv_attention", "rope_table"]
@@ -96,14 +96,6 @@ def split_kv_attention(q, k, v, split, scale):
         lse = lse.unsqueeze(-1)
     weight = torch.exp(lse - lse.amax(dim=0, keepdim=True))
     return ((out.float() * weight).sum(0, keepdim=True) / weight.sum(0, keepdim=True)).to(q.dtype)
-
-
-def _rope(x, table):
-    """RoPE as FP32 real rotations; ``table`` is ``[L, 1, D/2, 2]`` (cos, sin)."""
-    pairs = x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
-    re, im = pairs[..., 0], pairs[..., 1]
-    cos, sin = table[..., 0], table[..., 1]
-    return torch.stack((re * cos - im * sin, re * sin + im * cos), dim=-1).reshape_as(x).to(x.dtype)
 
 
 def rope_table(model, start_frame, num_frames, grid):
