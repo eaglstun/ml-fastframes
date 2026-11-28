@@ -24,6 +24,7 @@ on one GPU or context parallel on eight GPUs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 import torch
@@ -44,6 +45,45 @@ __all__ = ["LingBotModel", "MODELS", "FastFramesLingBot", "configure_backends"]
 
 SINK_FRAMES = 6
 MAX_LATENTS = 1024  # length of the upstream RoPE table
+
+
+@cache
+def _mps_eviction_kernel():
+    try:
+        return torch.mps.compile_shader("""
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void evict(device uint4* keys, device uint4* values,
+                              constant uint& layer_stride, constant uint& sink,
+                              constant uint& shift, constant uint& rolled,
+                              uint3 id [[thread_position_in_grid]]) {
+                device uint4* rows = (id.z == 0 ? keys : values) + ulong(id.y) * layer_stride + sink;
+                // Each lane owns one offset modulo shift. Move left in order so its
+                // source stays intact until read. Other lanes touch disjoint words.
+                for (uint x = id.x; x < rolled; x += shift) {
+                    rows[x] = rows[x + shift];
+                }
+            }
+        """).evict
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _mps_eviction_supported(keys, values):
+    # One batch per layer, with 16-byte words aligned at every token boundary.
+    return (keys.device.type == "mps" and keys.device == values.device
+            and keys.dtype == values.dtype == torch.bfloat16 and keys.shape == values.shape
+            and keys.ndim == 5 and keys.shape[1] == 1 and keys.stride() == values.stride()
+            and keys.is_contiguous() and values.is_contiguous() and keys.stride(2) % 8 == 0
+            and keys.storage_offset() == values.storage_offset() == 0)
+
+
+def _evict_layers(keys, values, sink, shift, rolled):
+    for tensor in (keys, values):
+        for layer in tensor:
+            for start in range(sink, sink + rolled, shift):
+                end = min(start + shift, sink + rolled)
+                layer[:, start:end].copy_(layer[:, start + shift:end + shift])
 
 
 @dataclass(frozen=True)
@@ -235,13 +275,16 @@ class FastFramesLingBot:
         if evicted:
             sink, shift = SINK_FRAMES * FRAME_TOKENS, evicted * FRAME_TOKENS
             rolled = (previous - evicted - SINK_FRAMES) * FRAME_TOKENS
-            # Contiguous per-layer copies in blocks of ``shift`` tokens, moving left: no block reads a
-            # region that an earlier block overwrote, so no temporary copy is needed.
-            for cache in (self.cache_k, self.cache_v):
-                for layer in cache:
-                    for start in range(sink, sink + rolled, shift):
-                        end = min(start + shift, sink + rolled)
-                        layer[:, start:end].copy_(layer[:, start + shift:end + shift])
+            # Both caches are dense BF16 with identical layout. A uint4 moves eight values
+            # verbatim; batching with a strided torch copy instead needs a large temporary.
+            kernel = _mps_eviction_kernel() if _mps_eviction_supported(self.cache_k, self.cache_v) else None
+            if kernel is None:
+                _evict_layers(self.cache_k, self.cache_v, sink, shift, rolled)
+            else:
+                row = self.cache_k.stride(2) // 8
+                width = min(shift, rolled) * row
+                kernel(self.cache_k, self.cache_v, self.cache_k.stride(0) // 8, sink * row, shift * row, rolled * row,
+                       threads=(width, len(self.cache_k), 2), group_size=(min(width, 128), 1, 1))
             if self.assist is not None:
                 self.assist.evict(sink, shift, rolled)
 

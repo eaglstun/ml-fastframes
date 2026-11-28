@@ -675,6 +675,33 @@ Measured with `torch.mps.driver_allocated_memory()` and `footprint`: the steady-
 17.9 GB instead of 20.0 GB. The process footprint runs ~4-7 GB above the driver number, mostly MPS's
 own per-shape graph state, which `empty_cache()` can't return.
 
+### LingBot rolling KV eviction
+
+The first overflow moves eight latent frames in two-frame bands. Later evictions move the same eight
+frames in four-frame bands. On MPS a single Metal dispatch moves both caches across all 30 layers.
+Each thread advances one column of 16-byte words in ascending band order, so overlapping rows can
+move in place. A strided PyTorch copy across layers took 79 ms at 832x464 and added up to 1 GiB of
+driver allocation in the experiment.
+
+Synchronized eviction medians in milliseconds on M4 Max with PyTorch 2.9.1, nine warmed, interleaved
+samples per implementation. The per-layer copies are from baseline `974f473`.
+
+| Size | First overflow, per-layer | First overflow, Metal | Steady state, per-layer | Steady state, Metal |
+| --- | ---: | ---: | ---: | ---: |
+| 416x240 | 3.649 | 2.604 | 4.343 | 2.698 |
+| 576x320 | 5.794 | 4.589 | 5.152 | 4.595 |
+| 832x464 | 10.608 | 9.424 | 10.143 | 9.510 |
+
+The synchronized live and driver byte counts were identical before and after each eviction for both
+paths (5.003 GB live, 5.004 GB driver at full size). A seed-0, 93-frame rollout of upstream example
+00 at 416x240 matched every baseline RGB frame, including the first and second evictions. The
+sub-millisecond full-size steady-state saving was too small to isolate in clip timing.
+
+```bash
+.venv/bin/python scripts/bench_lingbot_eviction.py
+.venv/bin/python -m pytest -q apps/lingbot/tests/test_eviction.py
+```
+
 ## Splitting a chunk with an iPad
 
 Could an iPad Pro share the DiT's work over a cable? Splitting _layers_ between devices (exo's
