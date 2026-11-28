@@ -774,6 +774,37 @@ Measured with `torch.mps.driver_allocated_memory()` and `footprint`: the steady-
 17.9 GB instead of 20.0 GB. The process footprint runs ~4-7 GB above the driver number, mostly MPS's
 own per-shape graph state, which `empty_cache()` can't return.
 
+### Fused BF16 `RMSNorm` on MPS
+
+`fastframes/wan/mps_rmsnorm.py` fuses `WanRMSNorm` (`fastframes/wan/model.py`) and LingBot's
+`rms_norm` (`apps/lingbot/dit.py`) for BF16 MPS tensors into a single threadgroup-reduction Metal
+dispatch (`#pragma METAL fp math_mode(safe)`, FMA contraction disabled, FP32 sum-of-squares, and
+two-step BF16 rounding `(x * rsqrt).to(bf16) * weight`). It reads 2D and batch-1 3D strided QKV
+`.chunk(3, -1)` slices directly via `row_stride` without materializing contiguous copies or FP32
+intermediate buffers. Set `FASTFRAMES_MPS_RMSNORM=eager` to select the eager PyTorch path.
+
+Measured on the M4 Max 64 GB (`779e25c` baseline, nine alternating warm samples for `Q + K + CrossQ`
+per block, ten alternating warm samples after four warm-up pairs for real LingBot block 0):
+
+| Shape / resolution | Isolated `Q+K+CrossQ` (eager → Metal) | Block 0, 4 cached frames | Block 0, 18 cached frames |
+| --- | ---: | ---: | ---: |
+| LingBot 416×240 (`T=1560, D=1536`) | 1.345 → 0.224 ms (6.0×) | 17.149 → 15.944 ms (-7.0%) | 20.992 → 19.642 ms (-6.4%) |
+| LingBot 576×320 (`T=2880, D=1536`) | 2.244 → 0.277 ms (8.1×) | 31.218 → 28.887 ms (-7.5%) | 47.626 → 45.230 ms (-5.0%) |
+| LingBot 832×464 (`T=6032, D=1536`) | 4.266 → 0.404 ms (10.6×) | 73.549 → 69.381 ms (-5.7%) | 164.049 → 159.743 ms (-2.6%) |
+| FastFrames-S (`T=1560, D=1536`) | 1.334 → 0.212 ms (6.3×) | - | - |
+| FastFrames-L (`T=1560, D=5120`) | 3.713 → 0.396 ms (9.4×) | - | - |
+
+Isolated outputs are deterministic and within at most 1 BF16 ULP of both eager MPS and a CPU FP64
+reference. Over a 93-frame (6-chunk) autoregressive LingBot rollout (example 00, seed 0, four
+warmed AB/BA pairs after a full warm-up pair), Metal won **all four pairs** at 416×240 (**5.27%**
+paired median reduction, range 5.16–5.33%, 12.21 → 11.57 s median;
+[results](docs/benchmarks/rmsnorm-416x240.jsonl)) and **three of four pairs** at 576×320 (**3.77%**
+paired median reduction, ~1.07 s saved, 27.97 → 27.72 s separate medians;
+[results](docs/benchmarks/rmsnorm-576x320.jsonl)), with identical steady-state driver memory.
+Early, middle and final frames (0, 46, 92) are deterministic run to run and visually preserve the
+same scene geometry, camera trajectory and detail (25.05 dB PSNR at 416×240, 31.05 dB at 576×320
+against the eager rollout).
+
 ## Splitting a chunk with an iPad
 
 Could an iPad Pro share the DiT's work over a cable? Splitting _layers_ between devices (exo's

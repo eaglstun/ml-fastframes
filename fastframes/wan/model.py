@@ -7,11 +7,11 @@ import math
 from dataclasses import dataclass
 
 import torch
-
-from ..device import f64_device, on_mps
 import torch.nn as nn
 
+from ..device import f64_device, on_mps
 from .attention import attention, cross_attention
+from .mps_rmsnorm import try_rms_norm
 
 __all__ = [
     "WanConfig",
@@ -108,6 +108,10 @@ class WanRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
+        if x.device.type == "mps":
+            normed = try_rms_norm(x, self.weight, self.eps)
+            if normed is not None:
+                return normed
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):
