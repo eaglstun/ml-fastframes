@@ -651,6 +651,62 @@ and the QKV/cross/output GEMMs ~13%. All the elementwise glue together (norms, R
 gates, cache write) is ~12%, so fusing it could win a few percent at most. Committing the
 command buffer after every block (sync or `Event().record()`) changed nothing beyond the noise.
 
+### Fused LingBot RoPE on MPS
+
+The MPS DiT and refiner rotate contiguous BF16 inputs with 128 channels per head in one Metal
+dispatch. Each thread reads a pair of input values, performs the four FP32 products and two
+FP32 sums with FMA contraction disabled, then writes one BF16 pair. Non-contiguous views,
+gradient-tracked inputs, other head dimensions or dtypes, and machines where the shader fails to
+compile use eager PyTorch. Set `FASTFRAMES_MPS_ROPE=eager` to select the original rotation.
+
+On the M4 Max 64 GB, PyTorch 2.9.1, baseline `974f473`, isolated rotations took the following
+times. Each entry is the median of nine synchronized warm samples per path, with alternating order.
+
+| Resolution | DiT, batch 1 (eager → Metal) | Refiner, batch 30 (eager → Metal) |
+| --- | ---: | ---: |
+| 416×240 | 0.553 → 0.152 ms | 17.659 → 0.791 ms |
+| 576×320 | 0.904 → 0.170 ms | 32.450 → 1.329 ms |
+| 832×464 | 1.900 → 0.165 ms | 68.910 → 2.726 ms |
+
+At 832×464, with the full refiner input resident and the allocator cache released, the driver
+reported 2.36 GB before each path and 6.82 GB eager or 2.92 GB Metal with the result live.
+Both outputs brought live tensor allocation from 0.56 GB to 1.11 GB. These counters sample
+the end of the rotation and include allocator reservations.
+
+Block 0 used real weights and example 00 inputs from the first denoising pass. Ten samples per path
+followed four alternating warm-up pairs. Each repeated block wrote the same cache slot before
+reading it. Its output matched exactly at both cache lengths.
+
+| Resolution | 4 cached frames (eager → Metal) | 18 cached frames (eager → Metal) |
+| --- | ---: | ---: |
+| 416×240 | 15.324 → 14.523 ms | 19.457 → 18.627 ms |
+| 576×320 | 34.602 → 33.120 ms | 60.075 → 60.003 ms |
+| 832×464 | 73.208 → 63.455 ms | 184.153 → 176.072 ms |
+
+At 576×320 with the full cache, the difference was within timing noise.
+
+Four 93-frame runs at 416×240, example 00, seed 0, matched every raw RGB frame.
+SHA-256 of the concatenated RGB bytes was
+`8647e29ce2829d5ba206f5d6a7256aa5bea7b3220136cbae7518eb71f9098aae`.
+In eager/Metal/Metal/eager order, rollouts after prompt setup took 12.369 / 13.211 / 14.575 /
+14.643 seconds including hashing. The two pairs differed in which path finished faster. The
+largest chunk-end driver readings were 13.00 / 13.03 / 11.96 / 13.03 GB. Whole-clip timing is
+inconclusive. System-wide GPU activity could not be inspected in the benchmark environment.
+
+Run the isolated benchmark and the real model comparisons from the repository root. The model
+checks use the installed checkpoints and pinned LingBot-World clone. The harness caps MPS before
+creating tensors or loading the model, at 45% of its recommended working set, or 60% for the
+full-resolution model. A 45% cap stopped full-resolution prompt setup while loading umT5.
+
+```bash
+.venv/bin/python -m pytest -q apps/lingbot/tests/test_mps_rope.py
+.venv/bin/python scripts/bench_lingbot_rope.py
+model=(--model lingbot-1.3b --checkpoint-dir checkpoints --lingbot-root upstream/lingbot-world-v2
+       --example upstream/lingbot-world-v2/examples/00)
+.venv/bin/python scripts/bench_lingbot_rope.py block "${model[@]}" --size 832x464
+.venv/bin/python scripts/bench_lingbot_rope.py clip "${model[@]}" --size 416x240
+```
+
 ### Memory: -3.3 GB peak, bit-identical frames
 
 A 141-frame `generate.py` run went from 30.6 to 27.3 GB of peak system memory: available memory at

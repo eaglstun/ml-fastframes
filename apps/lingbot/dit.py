@@ -39,6 +39,7 @@ from fastframes.device import synchronize
 from fastframes.wan.attention import attention as _ff_attention
 
 from .conditioning import CHUNK, LATENT_HEIGHT, LATENT_WIDTH
+from .mps_rope import try_rope
 
 __all__ = ["LingBotDiT", "DiTResult", "rope_real", "rope_table", "rope_frequencies", "all_gather_into"]
 
@@ -84,6 +85,10 @@ def rope_table(freqs, start_frame):
 
 def rope_real(value, table):
     """Absolute RoPE as FP32 real rotations; ``table`` from ``rope_table``."""
+    if value.device.type == "mps":
+        rotated = try_rope(value, table)
+        if rotated is not None:
+            return rotated
     pairs = value.float().reshape(*value.shape[:-1], value.shape[-1] // 2, 2)
     xr, xi = pairs[..., 0], pairs[..., 1]
     fr, fi = table[..., 0], table[..., 1]
