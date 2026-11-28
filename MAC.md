@@ -95,6 +95,31 @@ frames attend to a longer context. The refiner reads and writes the
 int8 slots through the same helpers, 10 layers at a time: refining all 40 at once ran out of memory
 in the 81-frame run.
 
+On MPS, `fastframes/wan/mps_kv8.py` quantizes and dequantizes contiguous 128-channel int8 cache
+rows in single Metal dispatches (`#pragma METAL fp math_mode(safe)`, FMA contraction disabled) and
+reuses one shared `(k, v)` BF16 scratch pair across all layers (`FASTFRAMES_MPS_KV8=eager` restores
+the eager path). Both `store` (`int8` data and `float32` scale) and `load` (`(int8 -> fp16) * (fp32 -> fp16) -> bf16`)
+match the eager operations bit for bit.
+
+On the M4 Max 64 GB (`779e25c` baseline, nine alternating warm samples per path):
+
+| Operation | FastFrames-S (`H=12`) | FastFrames-L (`H=40`) |
+| --- | ---: | ---: |
+| `store` (1,560 tokens) | 1.062 → 0.261 ms | 0.960 → 0.240 ms |
+| `_attended`, frame 10 (15,600 cached) | 1.392 → 0.356 ms | 4.062 → 0.791 ms |
+| `_attended`, frame 20 (31,200 cached) | 2.487 → 0.520 ms | 8.090 → 1.411 ms |
+
+At frame 20 on `H=40`, `_attended` driver memory stayed at 1.07 GB with the shared scratch buffer
+versus growing from 1.07 GB to 2.15 GB per tensor on the eager path. Real `Wan2.1-T2V-1.3B` block
+medians with `QuantizedKV` improved from 29.505 → 27.108 ms at frame 10 and 55.105 → 49.800 ms at
+frame 20. In four warmed AB/BA 81-frame `FastFrames-S --kv-bits 8` pairs (corgi prompt, seed 0),
+Metal won all four pairs (**7.03%** paired median reduction: 57.229 → 53.405 s, 51.109 → 48.038 s,
+50.944 → 47.184 s, 51.301 → 47.399 s; raw RGB SHA-256
+`d7dc26efe2111a00b96b7ce6891475b1d2293b5497d0857567b82ec605c75178` across all 10 clips;
+[results](docs/benchmarks/kv8-ffs-81f.jsonl)). Three short 25-frame `FastFrames-L --kv-bits 8 --dit-bits 8`
+pairs matched all frames (`1f675094093d79ad694cda8bacbaef8cedebee7c0a6390516c16de9588675b6a`) with
+run-order thermal drift dominating the short 7-latent horizon ([results](docs/benchmarks/kv8-ffl-25f.jsonl)).
+
 What the int8 cache does to the frames, against the BF16 cache at the same seed:
 
 | Run                     | PSNR (average, last frame) | What you see                                                              |

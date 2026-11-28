@@ -4,6 +4,7 @@
 # Modified for FastFrames: a frame-wise autoregressive Wan2.1 with a persistent
 # per-layer KV cache (one latent frame = one 1560-token cache slot).
 import functools
+import os
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +12,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from ..device import f64_device, on_mps
 from .attention import attention
+from .mps_kv8 import try_dequantize_kv, try_quantize_kv
 from .model import (
     Head,
     WanAttentionBlock,
@@ -78,12 +80,15 @@ class QuantizedKV:
     reads a dequantized BF16 copy of the layer's prefix, one layer at a time.
     """
 
-    def __init__(self, shape, device):
+    def __init__(self, shape, device, *, scratch=None):
         self.shape = shape
         self.data = torch.zeros(shape, dtype=torch.int8, device=device)
         self.scale = torch.zeros((*shape[:-1], 1), dtype=torch.float32, device=device)
+        self.scratch = scratch
 
     def store(self, start, end, x):
+        if try_quantize_kv(self.data[:, start:end], self.scale[:, start:end], x):
+            return
         x = x.float()
         scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 127.0
         self.data[:, start:end].copy_((x / scale).round_().clamp_(-127, 127).to(torch.int8))
@@ -91,6 +96,9 @@ class QuantizedKV:
 
     def load(self, start, end, out=None):
         """BF16 ``[B, end - start, H, D]`` (into ``out`` if given)."""
+        result = try_dequantize_kv(self.data[:, start:end], self.scale[:, start:end], out=out)
+        if result is not None:
+            return result
         values = (self.data[:, start:end].to(torch.float16) * self.scale[:, start:end].to(torch.float16))
         if out is None:
             return values.to(torch.bfloat16)
@@ -105,7 +113,13 @@ def allocate_kv_cache(model, num_frames, frame_tokens, batch_size=1, dtype=torch
     """
     shape = (batch_size, num_frames * frame_tokens, model.num_heads, model.dim // model.num_heads)
     if quantize:
-        return [{"k": QuantizedKV(shape, device), "v": QuantizedKV(shape, device)} for _ in range(model.num_layers)]
+        # One K/V scratch pair shared across all layers avoids growing per-layer allocations on MPS.
+        scratch = ((torch.empty(shape, dtype=dtype, device=device),
+                    torch.empty(shape, dtype=dtype, device=device))
+                   if torch.device(device).type == "mps" and dtype == torch.bfloat16 else None)
+        return [{"k": QuantizedKV(shape, device, scratch=None if scratch is None else scratch[0]),
+                 "v": QuantizedKV(shape, device, scratch=None if scratch is None else scratch[1])}
+                for _ in range(model.num_layers)]
     return [
         {"k": torch.zeros(shape, dtype=dtype, device=device),
          "v": torch.zeros(shape, dtype=dtype, device=device)}
@@ -129,7 +143,14 @@ def kv_read(slot, start, end):
 def _attended(slot, start, end, current):
     """The ``[0, end)`` keys or values a frame attends to: the cached prefix plus its own ``current``
     tokens at full precision (a quantized cache only compresses the context)."""
-    out = torch.empty((*slot.shape[:1], end, *slot.shape[2:]), dtype=current.dtype, device=current.device)
+    scratch = slot.scratch
+    if (scratch is not None and os.environ.get("FASTFRAMES_MPS_KV8") != "eager"
+            and scratch.device == current.device and scratch.dtype == current.dtype
+            and scratch.shape[0] == current.shape[0] and end <= scratch.shape[1]
+            and scratch.shape[2:] == current.shape[2:]):
+        out = scratch[:, :end]
+    else:
+        out = torch.empty((*slot.shape[:1], end, *slot.shape[2:]), dtype=current.dtype, device=current.device)
     if start:
         slot.load(0, start, out=out[:, :start])
     out[:, start:end].copy_(current)
