@@ -153,3 +153,31 @@ improvement. The PR is draft pending repeated end-to-end measurements to disting
 noise from a regression; the isolated gain is small enough that it may not justify
 shipping the added kernel. Two preliminary clip checks lacked the memory cap;
 validation was repeated with a 45% cap before the PR was opened.
+
+### Fused real RoPE
+
+[PR 29](https://github.com/eaglstun/ml-fastframes/pull/29), commit `9b876d9`, adds
+a single-dispatch Metal rotation for supported contiguous BF16 MPS tensors.
+Unsupported layouts, dtypes and autograd use the original operations. The shader
+preserves separate FP32 multiplication and addition rounding. Set
+`FASTFRAMES_MPS_ROPE=eager` to select the reference path.
+
+At 832x464, isolated DiT rotation fell from 1.900 to 0.165 ms; batch-30 refiner
+rotation fell from 68.910 to 2.726 ms. Driver allocation sampled after the latter
+operation fell from 6.82 to 2.92 GB, with 1.11 GB live tensors in both cases.
+These are operation measurements, not whole-process peak measurements.
+
+| Real block resolution | Four-frame cache baseline to Metal | Full cache baseline to Metal |
+| --- | --- | --- |
+| 416x240 | 15.324 to 14.523 ms | 19.457 to 18.627 ms |
+| 576x320 | 34.602 to 33.120 ms | 60.075 to 60.003 ms |
+| 832x464 | 73.208 to 63.455 ms | 184.153 to 176.072 ms |
+
+Full-size full-cache block time improved about 4.4%; the medium full-cache change
+is below noise. All tested block outputs matched. All 37 LingBot tests passed,
+including BF16 rounding, offset slices, batch-30 tensors, signed zeros, range
+boundaries, layout fallback and autograd fallback. Four 93-frame rollouts at
+416x240 produced identical hashes for every frame. Their eager/Metal/Metal/eager
+times were 12.369/13.211/14.575/14.643 s: upward drift prevents a whole-video
+speedup claim. Full-size model checks used the standard 60% cap after T5 loading
+hit the initial 45% cap safely. CUDA and physical iPad validation remain untested.
