@@ -11,6 +11,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from ..device import f64_device, on_mps
 from .attention import attention
+from .mps_rope import try_rope
 from .model import (
     Head,
     WanAttentionBlock,
@@ -138,6 +139,10 @@ def _attended(slot, start, end, current):
 
 def rope_real(x, table):
     """RoPE as FP32 real rotations; ``table`` is ``[L, 1, D/2, 2]`` (cos, sin)."""
+    if x.device.type == "mps":
+        rotated = try_rope(x, table)
+        if rotated is not None:
+            return rotated
     pairs = x.float().reshape(*x.shape[:-1], x.shape[-1] // 2, 2)
     real, imag = pairs[..., 0], pairs[..., 1]
     cos, sin = table[..., 0], table[..., 1]

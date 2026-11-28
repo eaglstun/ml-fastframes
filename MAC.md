@@ -651,13 +651,25 @@ and the QKV/cross/output GEMMs ~13%. All the elementwise glue together (norms, R
 gates, cache write) is ~12%, so fusing it could win a few percent at most. Committing the
 command buffer after every block (sync or `Event().record()`) changed nothing beyond the noise.
 
-### Fused LingBot RoPE on MPS
+### Fused LingBot and FastFrames RoPE on MPS
 
-The MPS DiT and refiner rotate contiguous BF16 inputs with 128 channels per head in one Metal
-dispatch. Each thread reads a pair of input values, performs the four FP32 products and two
+`fastframes/wan/mps_rope.py` (re-exported by `apps/lingbot/mps_rope.py`) rotates contiguous BF16
+inputs with 128 channels per head in one Metal dispatch across LingBot (`apps/lingbot/dit.py`),
+FastFrames T2V (`fastframes/wan/model.py`, `fastframes/wan/causal_model.py`), and the latency
+profiler (`evaluation/latency/dit.py`). Each thread reads a pair of input values, performs the four FP32 products and two
 FP32 sums with FMA contraction disabled, then writes one BF16 pair. Non-contiguous views,
 gradient-tracked inputs, other head dimensions or dtypes, and machines where the shader fails to
 compile use eager PyTorch. Set `FASTFRAMES_MPS_ROPE=eager` to select the original rotation.
+
+On FastFrames T2V shapes (`[1, 1560, H, 128]`, baseline `779e25c`, nine alternating warm samples),
+`causal_rope_apply` fell from 0.903 → 0.179 ms (`H=12`, driver bytes 76.0 → 42.5 MB) and
+1.775 → 0.209 ms (`H=40`). Real `CausalWanAttentionBlock` medians improved from 14.636 → 13.622 ms
+(frame 0) and 39.034 → 37.473 ms (frame 20) on `Wan2.1-T2V-1.3B`, and from 82.110 → 78.389 ms
+(frame 0) on `Wan2.1-T2V-14B`, with bit-identical block outputs. Four warmed AB/BA 81-frame
+`FastFrames-S` pairs matched every frame (`6bb2833b08891014ca80b703237f6d48fba66edc22201f7a93680336923956a8`;
+[results](docs/benchmarks/fastframes-rope-ffs-81f.jsonl)), with cold-to-warm upward thermal drift
+(40.5 → 52.5 s) exceeding the ~1–1.5 s whole-clip saving (paired median +1.24%, two wins each by
+first-in-pair order).
 
 On the M4 Max 64 GB, PyTorch 2.9.1, baseline `974f473`, isolated rotations took the following
 times. Each entry is the median of nine synchronized warm samples per path, with alternating order.

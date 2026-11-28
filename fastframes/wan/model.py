@@ -7,11 +7,11 @@ import math
 from dataclasses import dataclass
 
 import torch
-
-from ..device import f64_device, on_mps
 import torch.nn as nn
 
+from ..device import f64_device, on_mps
 from .attention import attention, cross_attention
+from .mps_rope import try_rope
 
 __all__ = [
     "WanConfig",
@@ -70,23 +70,36 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 _ROPE_TABLES = {}
 
 
+def _rope_table_fp32(freqs, start_frame, f, h, w, c, device):
+    key = (id(freqs), start_frame, f, h, w, str(device))
+    table = _ROPE_TABLES.get(key)
+    if table is None:
+        parts = freqs.cpu().split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+        fi = torch.cat([
+            parts[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            parts[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            parts[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(f * h * w, 1, -1)
+        table = _ROPE_TABLES[key] = torch.view_as_real(fi).float().contiguous().to(device)
+    return table
+
+
 def _causal_rope_apply_fp32(x, grid_sizes, freqs, start_frame=0):
     """``causal_rope_apply`` for devices without complex128 (MPS): the complex128
     table is built on the CPU once per (frame, grid) and applied as FP32 rotations."""
     n, c = x.size(2), x.size(3) // 2
+    grids = grid_sizes.tolist()
+    if grids and all(g == grids[0] for g in grids):
+        f, h, w = grids[0]
+        if f * h * w == x.size(1):
+            table = _rope_table_fp32(freqs, start_frame, f, h, w, c, x.device)
+            rotated = try_rope(x, table)
+            if rotated is not None:
+                return rotated
     output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+    for i, (f, h, w) in enumerate(grids):
         seq_len = f * h * w
-        key = (id(freqs), start_frame, f, h, w, str(x.device))
-        table = _ROPE_TABLES.get(key)
-        if table is None:
-            parts = freqs.cpu().split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-            fi = torch.cat([
-                parts[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                parts[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                parts[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-            ], dim=-1).reshape(seq_len, 1, -1)
-            table = _ROPE_TABLES[key] = torch.view_as_real(fi).float().contiguous().to(x.device)
+        table = _rope_table_fp32(freqs, start_frame, f, h, w, c, x.device)
         pairs = x[i, :seq_len].float().reshape(seq_len, n, c, 2)
         real, imag = pairs[..., 0], pairs[..., 1]
         cos, sin = table[..., 0], table[..., 1]
