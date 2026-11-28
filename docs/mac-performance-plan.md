@@ -181,3 +181,35 @@ boundaries, layout fallback and autograd fallback. Four 93-frame rollouts at
 times were 12.369/13.211/14.575/14.643 s: upward drift prevents a whole-video
 speedup claim. Full-size model checks used the standard 60% cap after T5 loading
 hit the initial 45% cap safely. CUDA and physical iPad validation remain untested.
+
+### Timestep modulation reuse rejected
+
+The third Astra experiment tested an optimistic frozen-weight prototype before
+adding mutation tracking or production caching. It precomputed all 30 blocks at
+all five timesteps, preserving the bits of the six FP32 modulation vectors.
+Building the bank took 2.95 ms and retained 7.03 MiB of live tensors and 8.25 MiB
+of driver allocation at every resolution.
+
+Alternating measurements of real block 0 gave these medians:
+
+| Resolution | Four-frame cache baseline to cached | Full cache baseline to cached |
+| --- | --- | --- |
+| 416x240 | 15.267 to 15.270 ms | 19.498 to 19.487 ms |
+| 576x320 | 28.326 to 28.406 ms | 52.137 to 51.908 ms |
+| 832x464 | 66.992 to 66.964 ms | 220.762 to 231.775 ms |
+
+Five cases changed by less than 0.5% with mixed signs; the last was approximately
+5% slower with substantial spread. Even this optimistic prototype showed no
+consistent improvement, so the added state and invalidation logic are not justified.
+No production code was changed and no fix PR was opened. Whole-clip and rebuild
+checks were omitted after rejecting the performance hypothesis. Full-size runs
+used the standard 60% memory cap; other runs used 45%.
+
+## Recommended disposition
+
+Review PR 29 for its measured RoPE and real-block improvements and exact frame
+parity. Keep PR 28 in draft until repeated clip timing resolves its possible
+regression; its tiny eviction saving alone may not justify another kernel.
+Do not implement timestep modulation caching based on the current measurements.
+All three experiments ran sequentially, on independent branches from `974f473`;
+their speedups cannot be added together and combined performance is unmeasured.
