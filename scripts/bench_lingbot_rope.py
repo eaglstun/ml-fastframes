@@ -2,6 +2,7 @@
 """Benchmark MPS RoPE at all three demo sizes or on a real model (--help)."""
 import argparse
 import hashlib
+import json
 import os
 import statistics
 import sys
@@ -79,6 +80,61 @@ def measure_block(original, *args):
     return original(*args)
 
 
+def measure_clip(pipe, image, prompt, rays, chunks, seed, mode):
+    os.environ["FASTFRAMES_MPS_ROPE"] = mode
+    pipe.start(image, prompt, seed=seed, latents=chunks * 4)
+    torch.mps.synchronize()
+    wall_start = time.perf_counter()
+    chunk_seconds, footprints, hashes = [], [], []
+    digest = hashlib.sha256()
+    for chunk in range(chunks):
+        torch.mps.synchronize()
+        start = time.perf_counter()
+        frames = pipe.step(rays(chunk))
+        torch.mps.synchronize()
+        chunk_seconds.append(time.perf_counter() - start)
+        footprints.append(memory())
+        for frame in frames.cpu().numpy():
+            data = frame.tobytes()
+            digest.update(data)
+            hashes.append(hashlib.sha256(data).hexdigest())
+        del frames
+    return {
+        "mode": mode, "generation_s": sum(chunk_seconds), "wall_s": time.perf_counter() - wall_start,
+        "chunk_s": chunk_seconds, "chunk_end_live_driver_bytes": footprints,
+        "frames": len(hashes), "rgb_sha256": digest.hexdigest(),
+    }, hashes
+
+
+def compare_clips(args, pipe, image, prompt, rays, chunks, seed):
+    # Pair 0 primes both paths all the way through a full cache. AB/BA balances order thereafter.
+    eager_first = ("eager", "metal")
+    reference = None
+    stream = args.output.open("x") if args.output else None
+    try:
+        for pair in range(args.pairs + 1):
+            order = eager_first if pair == 0 or pair % 2 == 1 else reversed(eager_first)
+            for mode in order:
+                record, hashes = measure_clip(pipe, image, prompt, rays, chunks, seed, mode)
+                if len(hashes) != args.frames:
+                    raise RuntimeError(f"Expected {args.frames} frames, got {len(hashes)}")
+                if reference is None:
+                    reference = hashes
+                    record["reference_frame_sha256"] = hashes
+                elif hashes != reference:
+                    first = next(i for i, (a, b) in enumerate(zip(hashes, reference)) if a != b)
+                    raise RuntimeError(f"Frame {first} differs from the eager warm-up in pair {pair} ({mode})")
+                record.update(pair=pair, size=args.size, seed=seed)
+                if stream:
+                    print(json.dumps(record), file=stream, flush=True)
+                print(f"pair {pair} ({'warm-up' if pair == 0 else 'measured'}), {mode}, "
+                      f"{record['frames']} frames: generation {record['generation_s']:.3f} s, "
+                      f"wall {record['wall_s']:.3f} s, SHA-256 {record['rgb_sha256']}", flush=True)
+    finally:
+        if stream:
+            stream.close()
+
+
 def run_model(args):
     from apps.lingbot.generate import apply_size, import_upstream, load_pipeline, read_condition
 
@@ -101,27 +157,7 @@ def run_model(args):
                 pipe.step(rays(chunk))
             return
 
-        reference = None
-        for mode in ("eager", "metal", "metal", "eager"):
-            os.environ["FASTFRAMES_MPS_ROPE"] = mode
-            pipe.start(image, prompt, seed=seed, latents=chunks * 4)
-            torch.mps.synchronize()
-            start = time.perf_counter()
-            digest = hashlib.sha256()
-            hashes, footprints = [], []
-            for chunk in range(chunks):
-                for frame in pipe.step(rays(chunk)).cpu().numpy():
-                    data = frame.tobytes()
-                    digest.update(data)
-                    hashes.append(hashlib.sha256(data).digest())
-                footprints.append(memory())
-            print(f"{mode} {len(hashes)} frames: {time.perf_counter() - start:.3f} s, {digest.hexdigest()}, "
-                  f"largest chunk-end live/driver bytes {max(footprints, key=lambda pair: pair[1])}", flush=True)
-            assert len(hashes) == args.frames
-            if reference is None:
-                reference = hashes
-            else:
-                assert reference == hashes
+        compare_clips(args, pipe, image, prompt, rays, chunks, seed)
     finally:
         pipe.close()
 
@@ -137,6 +173,10 @@ def main():
         add_model_arguments(model)
         model.add_argument("--example", type=Path, required=True)
         model.set_defaults(frames=93, seed=0, image=None, prompt=None)
+        if mode == "clip":
+            model.add_argument("--pairs", type=int, choices=(4, 6), default=4,
+                               help="measured AB/BA pairs after warm-up")
+            model.add_argument("--output", type=Path, help="write raw timings and hashes to a new JSONL file")
     args = parser.parse_args()
     # Full-resolution model + umT5 during prompt setup needs more than the isolated benchmark.
     limit_mps_memory(0.6 if args.mode and tuple(args.size) == (832, 464) else 0.45)

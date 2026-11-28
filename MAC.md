@@ -685,13 +685,55 @@ reading it. Its output matched exactly at both cache lengths.
 
 At 576×320 with the full cache, the difference was within timing noise.
 
-Four 93-frame runs at 416×240, example 00, seed 0, matched every raw RGB frame.
-SHA-256 of the concatenated RGB bytes was
-`8647e29ce2829d5ba206f5d6a7256aa5bea7b3220136cbae7518eb71f9098aae`.
-In eager/Metal/Metal/eager order, rollouts after prompt setup took 12.369 / 13.211 / 14.575 /
-14.643 seconds including hashing. The two pairs differed in which path finished faster. The
-largest chunk-end driver readings were 13.00 / 13.03 / 11.96 / 13.03 GB. Whole-clip timing is
-inconclusive. System-wide GPU activity could not be inspected in the benchmark environment.
+**93-frame generation, six warmed pairs per resolution.** On example 00, seed 0 at 832×464,
+Metal took less generation time in four of six pairs. The paired median reduction was **7.65%**
+(8.865 s), ranging from **5.70% slower to 12.23% faster**. At 416×240 it was faster in all six
+pairs, with a **4.12%** paired median reduction (0.569 s, range 0.27–7.34% faster). The
+median reduction among the three eager-first pairs and the three Metal-first pairs was
+7.06% and 8.24% respectively at trained size, versus 3.15% and 5.74% at small size.
+These estimates cover one scene, seed and device. Other GPU activity could not be inspected.
+
+Each resolution used one resident pipeline and warmed both paths with an entire clip before
+the six predetermined pairs. Each clip reset the image condition, caches, decoder and seed.
+Times sum six synchronized calls through camera-ray calculation, lazy image-condition encoding,
+denoising, KV updates, pixel decoding and the normal per-chunk cache release. Model loading,
+initial prompt encoding, clip reset, host copies and RGB hashing are outside those intervals.
+Generation medians were 118.176 s eager and 110.360 s Metal at trained size, and 13.757 s
+eager and 13.077 s Metal at small size. Including host copies and hashing after clip reset,
+the respective wall-clock medians were 118.324 / 110.474 s and 13.810 / 13.117 s.
+Each paired percentage uses that pair's eager time as its denominator.
+
+| Pair | First path | 416×240 eager / Metal (s) | 832×464 eager / Metal (s) |
+| ---: | --- | ---: | ---: |
+| 1 | Eager | 13.710 / 13.011 | 125.295 / 109.977 |
+| 2 | Metal | 13.804 / 13.011 | 113.136 / 103.814 |
+| 3 | Eager | 13.943 / 13.504 | 117.199 / 117.688 |
+| 4 | Metal | 13.223 / 13.188 | 122.773 / 111.006 |
+| 5 | Eager | 13.441 / 13.021 | 119.153 / 110.744 |
+| 6 | Metal | 14.174 / 13.133 | 86.085 / 90.993 |
+
+Median chunk generation times in seconds, grouped by the number of latent frames read from the cache.
+
+| Resolution and path | 4 frames | 8 | 12 | 16 | 18, first eviction | 18, steady |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 416×240 eager | 3.182 | 1.890 | 2.048 | 2.149 | 2.228 | 2.249 |
+| 416×240 metal | 3.038 | 1.819 | 1.908 | 2.050 | 2.136 | 2.140 |
+| 832×464 eager | 14.876 | 12.110 | 16.638 | 22.957 | 25.688 | 25.296 |
+| 832×464 metal | 14.978 | 11.861 | 15.701 | 20.705 | 23.379 | 23.192 |
+
+At trained size, the paired median reduction for the sum of the first four chunks was 7.66%,
+and for the final two full-cache chunks it was 7.65%. These reductions were 4.33% and 4.34%
+at small size. At trained size, the largest sampled chunk-end driver allocation per measured
+clip ranged from 17.60–18.20 GB eager and 18.20–19.86 GB Metal. Both paths ranged from
+11.96–13.03 GB at small size. These readings do not measure process peak memory.
+
+For each resolution, every one of the 93 frame hashes matched the first eager warm-up in
+all 13 subsequent clips. SHA-256 of the concatenated raw RGB frames was
+`2577ad585fa2e2e7d6c98b086e63686598e012f0ab8295b9250668a7fd73409b` at 832×464 and
+`8647e29ce2829d5ba206f5d6a7256aa5bea7b3220136cbae7518eb71f9098aae` at 416×240.
+The raw records include warm-ups (pair 0), all individual chunk times, live/driver bytes,
+and the 93 reference frame hashes. [832×464 results](docs/benchmarks/rope-832x464.jsonl) ·
+[416×240 results](docs/benchmarks/rope-416x240.jsonl).
 
 Run the isolated benchmark and the real model comparisons from the repository root. The model
 checks use the installed checkpoints and pinned LingBot-World clone. The harness caps MPS before
@@ -704,7 +746,8 @@ full-resolution model. A 45% cap stopped full-resolution prompt setup while load
 model=(--model lingbot-1.3b --checkpoint-dir checkpoints --lingbot-root upstream/lingbot-world-v2
        --example upstream/lingbot-world-v2/examples/00)
 .venv/bin/python scripts/bench_lingbot_rope.py block "${model[@]}" --size 832x464
-.venv/bin/python scripts/bench_lingbot_rope.py clip "${model[@]}" --size 416x240
+.venv/bin/python scripts/bench_lingbot_rope.py clip "${model[@]}" --size 416x240 --pairs 6 --output /tmp/rope-small.jsonl
+.venv/bin/python scripts/bench_lingbot_rope.py clip "${model[@]}" --size 832x464 --pairs 6 --output /tmp/rope-trained.jsonl
 ```
 
 ### Memory: -3.3 GB peak, bit-identical frames
