@@ -693,13 +693,36 @@ samples per implementation. The per-layer copies are from baseline `974f473`.
 | 832x464 | 10.608 | 9.424 | 10.143 | 9.510 |
 
 The synchronized live and driver byte counts were identical before and after each eviction for both
-paths (5.003 GB live, 5.004 GB driver at full size). A seed-0, 93-frame rollout of upstream example
-00 at 416x240 matched every baseline RGB frame, including the first and second evictions. The
-sub-millisecond full-size steady-state saving was too small to isolate in clip timing.
+paths (5.003 GB live, 5.004 GB driver at full size).
+
+A separate 416x240 clip benchmark warmed both implementations on all six chunks, then ran six
+alternating AB/BA pairs on one resident model. Each clip restarted upstream example 00 at seed 0.
+The benchmark timed synchronized chunk generation separately from copying and hashing its RGB output.
+All 14 clips matched the same 93 frame hashes, including the final 32 frames after the two evictions.
+
+| Measured pair | First run | Baseline (s) | Metal (s) | Metal minus baseline (s) |
+| --- | --- | ---: | ---: | ---: |
+| 1 | Baseline | 12.791 | 12.816 | +0.025 |
+| 2 | Metal | 13.196 | 12.851 | −0.344 |
+| 3 | Baseline | 13.112 | 13.257 | +0.145 |
+| 4 | Metal | 13.358 | 13.169 | −0.189 |
+| 5 | Baseline | 13.808 | 14.390 | +0.582 |
+| 6 | Metal | 15.332 | 14.864 | −0.468 |
+
+The first run won every pair. Metal won three of six, with a median paired difference of −0.082 s
+(−0.61%) and a range of −3.05% to +4.21%. The two chunks that evict also split three wins each,
+with paired differences between −0.213 s and +0.243 s. Both paths reached the same maximum sampled
+chunk-end driver allocation of 13.029 GB and finished at 8.736–8.745 GB. The earlier single-pair
+9% slowdown did not recur. Run-order variation exceeded the expected millisecond saving.
+The whole-clip results favor keeping the existing per-layer implementation as the default.
+[Raw timings, per-chunk memory, and frame hashes](docs/benchmarks/lingbot-eviction-416x240.jsonl)
 
 ```bash
 .venv/bin/python scripts/bench_lingbot_eviction.py
 .venv/bin/python -m pytest -q apps/lingbot/tests/test_eviction.py
+.venv/bin/python scripts/bench_lingbot_eviction_clip.py --model lingbot-1.3b --eager \
+  --size 416x240 --lingbot-root upstream/lingbot-world-v2 --checkpoint-dir checkpoints \
+  --example upstream/lingbot-world-v2/examples/00 --pairs 6 --output /tmp/kv-eviction.jsonl
 ```
 
 ## Splitting a chunk with an iPad
