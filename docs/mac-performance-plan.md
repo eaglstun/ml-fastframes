@@ -207,9 +207,111 @@ used the standard 60% memory cap; other runs used 45%.
 
 ## Recommended disposition
 
-Review PR 29 for its measured RoPE and real-block improvements and exact frame
-parity. Keep PR 28 in draft until repeated clip timing resolves its possible
-regression; its tiny eviction saving alone may not justify another kernel.
+Review PR 29: the follow-up below found a 4.12% median paired whole-clip reduction
+at 416x240 (six of six wins) and a more variable 7.65% at 832x464 (four of six),
+with exact frame parity. Leave PR 28 in draft and unmerged: the follow-up did not
+reproduce its earlier roughly 9% regression, but found no repeatable whole-clip
+benefit to justify the added kernel.
 Do not implement timestep modulation caching based on the current measurements.
 All three experiments ran sequentially, on independent branches from `974f473`;
 their speedups cannot be added together and combined performance is unmeasured.
+
+## Follow-up whole-clip validation
+
+The follow-up RoPE test uses the same resident pipeline and fixed scene, seed and
+93-frame horizon for every run. Both variants first generate a full warm-up clip.
+Six measured pairs at 832x464 alternate eager-first and Metal-first order, fixed
+before results are observed. Every clip recreates image conditioning and resets
+KV caches, decoder history and seeded noise.
+
+Generation time is the sum of synchronized per-chunk wall times, including camera
+rays, lazy condition encoding, DiT, refinement, decoding and cache releases.
+Model loading, prompt/start setup, CPU output copies and hashing are outside this
+metric. Separate wall times include the copies and hashes. Every frame is checked
+against the eager warm-up, and every chunk records live and driver allocation.
+Chunk-end allocation readings are not peak-memory measurements. Full-size runs
+use a 60% memory cap before allocation; smaller runs use 45%.
+
+System thermal and performance counters were unavailable in this session, so
+timing drift cannot be attributed to a specific cause. Adjacent balanced pairs
+reduce order bias but cannot eliminate all variation from other system activity.
+
+### Trained resolution RoPE results
+
+All 14 clips at 832x464 (two warm-ups and six measured pairs) matched all 93 frames
+against the same eager reference. Measured synchronized generation times:
+
+| Pair | Order | Eager | Metal | Reduction with Metal |
+| --- | --- | --- | --- | --- |
+| 1 | Eager then Metal | 125.295 s | 109.977 s | 12.23% |
+| 2 | Metal then eager | 113.136 s | 103.814 s | 8.24% |
+| 3 | Eager then Metal | 117.199 s | 117.688 s | -0.42% |
+| 4 | Metal then eager | 122.773 s | 111.006 s | 9.58% |
+| 5 | Eager then Metal | 119.153 s | 110.744 s | 7.06% |
+| 6 | Metal then eager | 86.085 s | 90.993 s | -5.70% |
+
+The median paired reduction is 7.65%, with Metal winning four of six pairs.
+The separate medians are 118.176 s eager and 110.360 s Metal. The eager-first and
+Metal-first groups have median paired reductions of 7.06% and 8.24%, respectively.
+The final two full-cache chunks show a median paired reduction of 7.65%, similar
+to the first four chunks' 7.66%.
+
+This supports a typical benefit in this run, but the range crosses zero and does
+not establish a guaranteed or statistically significant whole-clip improvement.
+Maximum sampled chunk-end driver allocation per clip ranged 18.20–19.86 GB for
+Metal and 17.60–18.20 GB for eager. There is no whole-clip memory-reduction claim.
+The single scene, seed and 93-frame horizon also limit generalization.
+
+### Small resolution RoPE results
+
+The same two warm-ups and six measured pairs at 416x240 matched all 93 frames in
+every clip. Metal won all six pairs, with a median paired reduction of 4.12%
+(0.569 s) and a range of 0.27–7.34%. The separate generation-time medians were
+13.757 s eager and 13.077 s Metal. Per-clip maximum sampled chunk-end driver
+allocation ranged 11.96–13.03 GB for both paths.
+
+| Pair | Eager | Metal | Reduction with Metal |
+| --- | --- | --- | --- |
+| 1 | 13.710 s | 13.011 s | 5.10% |
+| 2 | 13.804 s | 13.011 s | 5.74% |
+| 3 | 13.943 s | 13.504 s | 3.15% |
+| 4 | 13.223 s | 13.188 s | 0.27% |
+| 5 | 13.441 s | 13.021 s | 3.13% |
+| 6 | 14.174 s | 13.133 s | 7.34% |
+
+The follow-up therefore provides consistent whole-clip evidence at small
+resolution and a positive but more variable result at trained resolution.
+PR 29 includes the improved benchmark and raw JSONL records in `docs/benchmarks/`.
+These measurements supersede the initial four-clip test's inconclusive result
+without implying equal gains for other scenes, sizes or interactive preview mode.
+
+### Cache eviction follow-up
+
+PR 28 uses the same full warm-ups, six balanced measured pairs and separate
+generation/hash timing at 416x240. Its baseline method was checked against the
+parsed Python AST of the original `_evict` at `974f473`. RoPE remains unchanged
+in this independent branch. All 14 clips matched all 93 reference frame hashes.
+
+| Pair | Baseline | Metal eviction | Reduction with Metal |
+| --- | --- | --- | --- |
+| 1 | 12.791 s | 12.816 s | -0.20% |
+| 2 | 13.196 s | 12.851 s | 2.61% |
+| 3 | 13.112 s | 13.257 s | -1.11% |
+| 4 | 13.358 s | 13.169 s | 1.42% |
+| 5 | 13.808 s | 14.390 s | -4.21% |
+| 6 | 15.332 s | 14.864 s | 3.05% |
+
+The candidate won three of six pairs. Its median paired reduction was 0.61%
+(82 ms), but **the first run in every pair won regardless of implementation**.
+The run-order effect prevents interpreting that median as a kernel benefit.
+The final two chunks, which actually evict cache entries, also split three wins
+each: the median saving was 19 ms and the range crossed zero widely.
+
+Both implementations reached the same maximum sampled chunk-end driver allocation
+of 13.029 GB. Final driver readings were 8.736–8.745 GB. The earlier roughly 9%
+whole-clip slowdown did not reproduce, and no repeatable whole-clip gain was
+established. Keep the PR draft and unmerged. A full-resolution repeat was not
+run: the isolated millisecond saving is far below the observed clip timing
+variation and does not justify another long run. The PR contains the complete
+JSONL samples at `docs/benchmarks/lingbot-eviction-416x240.jsonl` and a reusable
+clip benchmark.
