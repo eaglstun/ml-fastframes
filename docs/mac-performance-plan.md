@@ -130,5 +130,26 @@ this repository is the tested integration reference.
 
 ## Results
 
-The implementation results and PR links will be appended here as each sequential
-experiment completes.
+### Batched cache eviction
+
+[PR 28](https://github.com/eaglstun/ml-fastframes/pull/28), commit `bf3c3ac`, replaces
+the per-layer loop on supported MPS buffers with a single Metal dispatch. The
+initial PyTorch strided-copy experiment was rejected: it increased driver memory
+by about 1 GiB and took 79 ms instead of roughly 10 ms at full size.
+
+Nine-sample interleaved medians for the Metal implementation:
+
+| Resolution | First eviction baseline to Metal | Steady eviction baseline to Metal |
+| --- | --- | --- |
+| 416x240 | 3.649 to 2.604 ms | 4.343 to 2.698 ms |
+| 576x320 | 5.794 to 4.589 ms | 5.152 to 4.595 ms |
+| 832x464 | 10.608 to 9.424 ms | 10.143 to 9.510 ms |
+
+All 35 LingBot tests passed and all 93 raw RGB frames matched for example 00,
+seed 0 at 416x240, crossing both eviction boundaries. Isolated allocation counters
+stayed flat. The capped whole-clip comparison, including hashing, was 12.89 s
+baseline versus 14.02 s candidate. This does **not** establish a whole-video
+improvement. The PR is draft pending repeated end-to-end measurements to distinguish
+noise from a regression; the isolated gain is small enough that it may not justify
+shipping the added kernel. Two preliminary clip checks lacked the memory cap;
+validation was repeated with a 45% cap before the PR was opened.
